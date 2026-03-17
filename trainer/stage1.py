@@ -1,6 +1,7 @@
 import contextlib
 import csv
 import os
+import re
 from collections import defaultdict
 
 import pytorch_lightning as pl
@@ -24,9 +25,10 @@ def precision2dtype(precision):
 
 
 class Stage1Trainer(pl.LightningModule):
-    def __init__(self, vocab_size, model_config, train_config):
+    def __init__(self, vocab_size, model_config, train_config, tokenizer=None):
         super().__init__()
         self.train_config = train_config
+        self.tokenizer = tokenizer
         stage1_cfg = getattr(train_config, "stage1", {})
         if train_config.precision == 'bf16-mixed':
             torch_dtype = "bfloat16"
@@ -64,6 +66,34 @@ class Stage1Trainer(pl.LightningModule):
         self.val_pos_token_id = None
         self.val_neg_token_id = None
         self.use_base_forward_for_validation = False
+        self._val_metric_buckets = {}
+        self._val_metric_counts = {}
+        self._reg_key_to_idx = {}
+
+        # WM regression normalization and molecular_weight curriculum.
+        # Default stds roughly match common chemistry ranges; can be overridden in config.
+        self.regression_stds = {
+            "molecular_weight": 500.0,
+            "logp": 5.0,
+            "tpsa": 150.0,
+            "hbd": 5.0,
+            "hba": 10.0,
+            "num_rings": 6.0,
+            "aromatic_ring_count": 4.0,
+            "qed": 1.0,
+        }
+        cfg_stds = getattr(stage1_cfg, "regression_target_stds", None)
+        if isinstance(cfg_stds, dict):
+            for k, v in cfg_stds.items():
+                try:
+                    self.regression_stds[str(k)] = float(v)
+                except (TypeError, ValueError):
+                    pass
+
+        self.mw_warmup_start = float(getattr(stage1_cfg, "mw_warmup_start", 5.0))
+        self.mw_warmup_end = float(getattr(stage1_cfg, "mw_warmup_end", 1.0))
+        self.mw_warmup_steps = int(getattr(stage1_cfg, "mw_warmup_steps", 2000))
+        self.non_mw_reg_scale = float(getattr(stage1_cfg, "non_mw_reg_scale", 0.5))
     
     def maybe_autocast(self, dtype=torch.float16):
         # if on cpu, don't use autocast
@@ -122,6 +152,7 @@ class Stage1Trainer(pl.LightningModule):
     def _compute_wm_loss(self, outputs, batch):
         reg_preds = outputs["wm_preds"]["regression"]
         cls_logits = outputs["wm_preds"]["classification_logits"]
+        reg_keys = outputs["wm_preds"].get("regression_keys", [])
         reg_targets = batch["property_regression_targets"].to(reg_preds.device)
         reg_mask = batch["property_regression_mask"].to(reg_preds.device)
         cls_targets = batch["property_classification_targets"].to(cls_logits.device)
@@ -129,8 +160,28 @@ class Stage1Trainer(pl.LightningModule):
 
         reg_loss = torch.tensor(0.0, device=reg_preds.device)
         if reg_mask.any():
-            diff = (reg_preds - reg_targets).pow(2)
-            reg_loss = (diff * reg_mask.to(diff.dtype)).sum() / reg_mask.to(diff.dtype).sum().clamp(min=1.0)
+            # Normalize each regression target by dataset-scale stds to reduce
+            # magnitude mismatch (especially molecular_weight).
+            std_vec = torch.ones((reg_preds.shape[1],), device=reg_preds.device, dtype=reg_preds.dtype)
+            for i, key in enumerate(reg_keys):
+                std_vec[i] = float(self.regression_stds.get(key, 1.0))
+            norm_preds = reg_preds / std_vec.unsqueeze(0)
+            norm_targets = reg_targets / std_vec.unsqueeze(0)
+
+            diff = (norm_preds - norm_targets).pow(2)
+
+            # Dynamic MW emphasis: large in early phase, decays later.
+            mw_scale = self.mw_warmup_end
+            if self.mw_warmup_steps > 0:
+                p = min(1.0, float(self.global_step) / float(self.mw_warmup_steps))
+                mw_scale = self.mw_warmup_start + (self.mw_warmup_end - self.mw_warmup_start) * p
+
+            dim_w = torch.full((reg_preds.shape[1],), self.non_mw_reg_scale, device=reg_preds.device, dtype=reg_preds.dtype)
+            if "molecular_weight" in reg_keys:
+                mw_idx = reg_keys.index("molecular_weight")
+                dim_w[mw_idx] = mw_scale
+            weighted = diff * dim_w.unsqueeze(0)
+            reg_loss = (weighted * reg_mask.to(weighted.dtype)).sum() / reg_mask.to(weighted.dtype).sum().clamp(min=1.0)
 
         cls_loss = torch.tensor(0.0, device=cls_logits.device)
         if cls_mask.any():
@@ -139,6 +190,79 @@ class Stage1Trainer(pl.LightningModule):
             cls_loss = (bce * cls_mask.to(bce.dtype)).sum() / cls_mask.to(bce.dtype).sum().clamp(min=1.0)
 
         return reg_loss + cls_loss
+
+    def _decode_pred_texts(self, logits, labels):
+        if self.tokenizer is None:
+            return ["" for _ in range(labels.shape[0])]
+        pred_shift = logits[:, :-1, :].argmax(dim=-1)
+        label_shift = labels[:, 1:]
+        texts = []
+        for bi in range(pred_shift.shape[0]):
+            valid = label_shift[bi] != -100
+            ids = pred_shift[bi][valid]
+            if ids.numel() == 0:
+                texts.append("")
+            else:
+                texts.append(self.tokenizer.decode(ids.tolist(), skip_special_tokens=True).strip())
+        return texts
+
+    def _parse_binary_pred(self, text, task_name):
+        t = (text or "").strip().lower()
+        ds = str(task_name or "").upper()
+        if ds == "PAMPA":
+            if "high permeability" in t:
+                return 1
+            if "low-to-moderate" in t or "low to moderate" in t or "low permeability" in t:
+                return 0
+        if "answer: yes" in t or re.search(r"\byes\b", t):
+            return 1
+        if "answer: no" in t or re.search(r"\bno\b", t):
+            return 0
+        return None
+
+    def _parse_mcq_pred(self, text):
+        t = text or ""
+        m = re.search(r"Answer\s*:\s*([ABCD])", t, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).upper()
+        m = re.search(r"\b([ABCD])\b", t.strip(), flags=re.IGNORECASE)
+        if m:
+            return m.group(1).upper()
+        return None
+
+    def _parse_float_pred(self, text):
+        t = text or ""
+        m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", t)
+        if not m:
+            return None
+        try:
+            return float(m.group(0))
+        except (TypeError, ValueError):
+            return None
+
+    def _binary_auc(self, y_true, y_score):
+        # Rank-based AUC with tie handling.
+        if len(y_true) == 0:
+            return None
+        y = torch.tensor(y_true, dtype=torch.float32)
+        s = torch.tensor(y_score, dtype=torch.float32)
+        n_pos = int((y == 1).sum().item())
+        n_neg = int((y == 0).sum().item())
+        if n_pos == 0 or n_neg == 0:
+            return None
+        order = torch.argsort(s)
+        ranks = torch.zeros_like(s)
+        i = 0
+        while i < len(order):
+            j = i + 1
+            while j < len(order) and float(s[order[j]]) == float(s[order[i]]):
+                j += 1
+            avg_rank = 0.5 * (i + 1 + j)
+            ranks[order[i:j]] = avg_rank
+            i = j
+        sum_pos_ranks = float(ranks[y == 1].sum().item())
+        auc = (sum_pos_ranks - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+        return float(auc)
 
     def training_step(self, batch, batch_idx):
         task_type = batch["task_type"]
@@ -209,70 +333,58 @@ class Stage1Trainer(pl.LightningModule):
         score = -lm_loss
         batch_size = batch["input_ids"].size(0)
         source_name = batch["source_dataset"][0] if len(batch["source_dataset"]) > 0 else "unknown"
+        logits = outputs["logits"]
+        labels = batch["labels"].to(logits.device)
+        pred_texts = self._decode_pred_texts(logits, labels)
+        gold_texts = batch.get("text_targets", [""] * batch_size)
+        task_kind_list = batch.get("task_kind", [None] * batch_size)
+        task_name_list = batch.get("task_name", [source_name] * batch_size)
+        task_label = batch.get("task_label", torch.full((batch_size,), -1, dtype=torch.long)).tolist()
+        task_label_text = batch.get("task_label_text", [None] * batch_size)
+        task_regression_value = batch.get("task_regression_value", torch.zeros((batch_size,), dtype=torch.float32)).tolist()
+        task_regression_mask = batch.get("task_regression_mask", torch.zeros((batch_size,), dtype=torch.bool)).tolist()
 
-        # Downstream test accuracy (binary): use the first supervised token position,
-        # and compare P(Yes-token) vs P(No-token).
-        acc = torch.tensor(0.0, device=self.device)
-        if "task_label_mask" in batch and batch["task_label_mask"].any():
-            logits = outputs["logits"]  # [B, T, V]
-            labels = batch["labels"].to(logits.device)  # [B, T]
-            task_label = batch["task_label"].to(logits.device)
-            task_label_mask = batch["task_label_mask"].to(logits.device)
+        for i in range(batch_size):
+            ds = str(task_name_list[i] or source_name)
+            kind = str(task_kind_list[i] or "")
+            self._val_metric_buckets.setdefault(ds, {"binary_y": [], "binary_pred": [], "binary_score": [], "mcq_y": [], "mcq_pred": [], "reg_y": [], "reg_pred": []})
+            pred_txt = pred_texts[i]
+            gold_txt = gold_texts[i] if i < len(gold_texts) else ""
 
-            # Shift for causal LM alignment.
-            logit_shift = logits[:, :-1, :]  # predict labels[:, 1:]
-            label_shift = labels[:, 1:]
-            valid_shift = label_shift != -100
-
-            first_pos = torch.full((batch_size,), -1, dtype=torch.long, device=logits.device)
-            for bi in range(batch_size):
-                pos = torch.nonzero(valid_shift[bi], as_tuple=False).flatten()
-                if pos.numel() == 0:
-                    continue
-                first_pos[bi] = int(pos[0].item())
-
-            # Infer yes/no token ids from labeled samples (cached across val steps).
-            for bi in range(batch_size):
-                if not bool(task_label_mask[bi]) or int(first_pos[bi].item()) < 0:
-                    continue
-                gold_tok = int(label_shift[bi, first_pos[bi]].item())
-                y = int(task_label[bi].item())
-                if y == 1 and self.val_pos_token_id is None:
-                    self.val_pos_token_id = gold_tok
-                if y == 0 and self.val_neg_token_id is None:
-                    self.val_neg_token_id = gold_tok
-
-            if self.val_pos_token_id is not None and self.val_neg_token_id is not None:
-                used_idx = []
-                used_pos = []
-                used_label = []
-                for bi in range(batch_size):
-                    if not bool(task_label_mask[bi]) or int(first_pos[bi].item()) < 0:
-                        continue
-                    used_idx.append(bi)
-                    used_pos.append(int(first_pos[bi].item()))
-                    used_label.append(int(task_label[bi].item()))
-                if len(used_idx) > 0:
-                    idx_t = torch.tensor(used_idx, device=logits.device, dtype=torch.long)
-                    pos_t = torch.tensor(used_pos, device=logits.device, dtype=torch.long)
-                    y_t = torch.tensor(used_label, device=logits.device, dtype=torch.long)
-                    step_logits = logit_shift[idx_t, pos_t, :]  # [N, V]
-                    logit_pos = step_logits[:, int(self.val_pos_token_id)]
-                    logit_neg = step_logits[:, int(self.val_neg_token_id)]
-                    pred_label = (logit_pos > logit_neg).long()
-                    acc = (pred_label == y_t).float().mean()
+            if kind == "binary_classification":
+                y = int(task_label[i]) if i < len(task_label) else -1
+                if y in (0, 1):
+                    p = self._parse_binary_pred(pred_txt, ds)
+                    if p is not None:
+                        self._val_metric_buckets[ds]["binary_y"].append(y)
+                        self._val_metric_buckets[ds]["binary_pred"].append(int(p))
+                        self._val_metric_buckets[ds]["binary_score"].append(float(p))
+            elif kind == "mcq4":
+                y = str(task_label_text[i] or "").upper()
+                if y in ("A", "B", "C", "D"):
+                    p = self._parse_mcq_pred(pred_txt)
+                    if p in ("A", "B", "C", "D"):
+                        self._val_metric_buckets[ds]["mcq_y"].append(y)
+                        self._val_metric_buckets[ds]["mcq_pred"].append(p)
+            elif kind == "regression":
+                has_reg = bool(task_regression_mask[i]) if i < len(task_regression_mask) else False
+                if has_reg:
+                    y = float(task_regression_value[i])
+                    p = self._parse_float_pred(pred_txt)
+                    if p is not None:
+                        self._val_metric_buckets[ds]["reg_y"].append(y)
+                        self._val_metric_buckets[ds]["reg_pred"].append(float(p))
 
         self.log("val/loss", lm_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
         self.log("val/score", score, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
-        self.log("val/acc", acc, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
         self.log(f"val/loss_{source_name}", lm_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
         self.log(f"val/score_{source_name}", score, on_step=False, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
-        self.log(f"val/acc_{source_name}", acc, on_step=False, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
-        return {"val_loss": lm_loss.detach(), "val_score": score.detach(), "val_acc": acc.detach()}
+        return {"val_loss": lm_loss.detach(), "val_score": score.detach()}
 
     def on_validation_epoch_start(self):
         self.val_pos_token_id = None
         self.val_neg_token_id = None
+        self._val_metric_buckets = {}
 
     def on_validation_epoch_end(self):
         if self.trainer.sanity_checking:
@@ -298,13 +410,67 @@ class Stage1Trainer(pl.LightningModule):
             "epoch": int(self.current_epoch),
             "val_loss": _to_float("val/loss", 0.0),
             "val_score": _to_float("val/score", 0.0),
-            "val_acc": _to_float("val/acc", 0.0),
         }
+        # Aggregate metrics by task family.
+        all_bin_y, all_bin_p, all_bin_s = [], [], []
+        all_mcq_y, all_mcq_p = [], []
+        all_reg_y, all_reg_p = [], []
+        for ds, bucket in self._val_metric_buckets.items():
+            by, bp, bs = bucket["binary_y"], bucket["binary_pred"], bucket["binary_score"]
+            my, mp = bucket["mcq_y"], bucket["mcq_pred"]
+            ry, rp = bucket["reg_y"], bucket["reg_pred"]
+            if len(by) > 0:
+                acc = float(sum(int(a == b) for a, b in zip(bp, by)) / len(by))
+                auc = self._binary_auc(by, bs)
+                self.log(f"val/acc_{ds}", acc, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+                row[f"val_acc_{ds}"] = acc
+                if auc is not None:
+                    self.log(f"val/auc_{ds}", auc, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+                    row[f"val_auc_{ds}"] = auc
+                all_bin_y.extend(by); all_bin_p.extend(bp); all_bin_s.extend(bs)
+            if len(my) > 0:
+                acc_mcq = float(sum(int(a == b) for a, b in zip(mp, my)) / len(my))
+                self.log(f"val/mcq_acc_{ds}", acc_mcq, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+                row[f"val_mcq_acc_{ds}"] = acc_mcq
+                all_mcq_y.extend(my); all_mcq_p.extend(mp)
+            if len(ry) > 0:
+                err = [abs(a - b) for a, b in zip(rp, ry)]
+                mae = float(sum(err) / len(err))
+                mse = float(sum((a - b) ** 2 for a, b in zip(rp, ry)) / len(ry))
+                rmse = mse ** 0.5
+                self.log(f"val/mae_{ds}", mae, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+                self.log(f"val/rmse_{ds}", rmse, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+                row[f"val_mae_{ds}"] = mae
+                row[f"val_rmse_{ds}"] = rmse
+                all_reg_y.extend(ry); all_reg_p.extend(rp)
+
+        if len(all_bin_y) > 0:
+            acc = float(sum(int(a == b) for a, b in zip(all_bin_p, all_bin_y)) / len(all_bin_y))
+            auc = self._binary_auc(all_bin_y, all_bin_s)
+            self.log("val/acc", acc, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
+            row["val_acc"] = acc
+            if auc is not None:
+                self.log("val/auc", auc, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
+                row["val_auc"] = auc
+        if len(all_mcq_y) > 0:
+            acc_mcq = float(sum(int(a == b) for a, b in zip(all_mcq_p, all_mcq_y)) / len(all_mcq_y))
+            self.log("val/mcq_acc", acc_mcq, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
+            row["val_mcq_acc"] = acc_mcq
+        if len(all_reg_y) > 0:
+            err = [abs(a - b) for a, b in zip(all_reg_p, all_reg_y)]
+            mae = float(sum(err) / len(err))
+            mse = float(sum((a - b) ** 2 for a, b in zip(all_reg_p, all_reg_y)) / len(all_reg_y))
+            rmse = mse ** 0.5
+            self.log("val/mae", mae, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
+            self.log("val/rmse", rmse, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
+            row["val_mae"] = mae
+            row["val_rmse"] = rmse
+
         # Add dynamic per-dataset val metrics (e.g. BACE/BBBP/HIV/Clintox/Delaney/LIPO/Tox21).
         for k in list(metrics.keys()):
             if not isinstance(k, str):
                 continue
-            if k.startswith("val/score_") or k.startswith("val/acc_") or k.startswith("val/loss_"):
+            if k.startswith("val/score_") or k.startswith("val/loss_"):
                 row[k.replace("/", "_")] = _to_float(k, 0.0)
 
         csv_path = self.test_results_csv_path

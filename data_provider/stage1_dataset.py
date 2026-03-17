@@ -2,6 +2,7 @@ import json
 import os
 import csv
 import random
+import re
 from collections import defaultdict
 
 import numpy as np
@@ -585,6 +586,7 @@ def build_downstream_eval_samples_from_csv(
                             "task_kind": task_kind,
                             "label": label,
                             "label_text": label_text,
+                            "value": reg_value if task_kind == "regression" else None,
                         },
                     },
                     "quality": {"quality_score": None, "quality_label": "test"},
@@ -598,3 +600,167 @@ def build_downstream_eval_samples_from_csv(
             )
         print(f"[Stage1Eval] {dataset_name}: picked {len(picked)}/{len(rows)} samples from {path}")
     return all_samples
+
+
+def _extract_answer_choice(text):
+    if not isinstance(text, str):
+        return None
+    m = re.search(r"Answer\s*:\s*([ABCD])", text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    m = re.search(r"\b([ABCD])\b", text.strip(), flags=re.IGNORECASE)
+    if m:
+        return m.group(1).upper()
+    return None
+
+
+def build_moleculeqa_eval_samples(test_json_path, test_mol_json_path=None, sample_size=1000, seed=42):
+    if not os.path.exists(test_json_path):
+        raise FileNotFoundError(f"MoleculeQA test file not found: {test_json_path}")
+    with open(test_json_path, "r", encoding="utf-8") as f:
+        test_data = json.load(f)
+    if not isinstance(test_data, list):
+        raise RuntimeError("MoleculeQA test.json should be a JSON list.")
+
+    # Optional cid coverage check against test_mol.json.
+    valid_cids = None
+    if isinstance(test_mol_json_path, str) and len(test_mol_json_path) > 0 and os.path.exists(test_mol_json_path):
+        with open(test_mol_json_path, "r", encoding="utf-8") as f:
+            mol_data = json.load(f)
+        if isinstance(mol_data, list):
+            valid_cids = set(str(x.get("cid")) for x in mol_data if isinstance(x, dict) and x.get("cid") is not None)
+
+    rows = []
+    for item in test_data:
+        if not isinstance(item, dict):
+            continue
+        convs = item.get("conversations") or []
+        if not isinstance(convs, list) or len(convs) == 0 or not isinstance(convs[0], dict):
+            continue
+        user = convs[0].get("user", "")
+        assistant = convs[0].get("assistant", "")
+        smiles = item.get("smiles", "")
+        cid = item.get("cid")
+        if not isinstance(smiles, str) or len(smiles) == 0:
+            continue
+        if valid_cids is not None and cid is not None and str(cid) not in valid_cids:
+            continue
+        choice = _extract_answer_choice(assistant)
+        if choice is None:
+            continue
+        rows.append(
+            {
+                "qid": item.get("qid"),
+                "cid": cid,
+                "smiles": smiles,
+                "system": item.get("system", ""),
+                "instruction": user,
+                "choice": choice,
+            }
+        )
+    rng = random.Random(seed)
+    if sample_size is not None and sample_size > 0 and len(rows) > sample_size:
+        rows = rng.sample(rows, int(sample_size))
+
+    samples = []
+    for idx, r in enumerate(rows):
+        choice_to_idx = {"A": 0, "B": 1, "C": 2, "D": 3}
+        samples.append(
+            {
+                "sample_id": r.get("qid") or f"moleculeqa_{idx}",
+                "source_dataset": "MoleculeQA",
+                "split": "test",
+                "task_type": "downstream",
+                "stage_tags": ["stage1", "stage3"],
+                "molecule": {"smiles": r["smiles"], "canonical_smiles": r["smiles"], "iupac_name": None},
+                "input": {
+                    "system_prompt": r.get("system") or "You are a chemistry research assistant.",
+                    "instruction": r.get("instruction") or "Molecule: <mol>\nPlease answer the multiple-choice question.",
+                    "conversation_history": [],
+                },
+                "targets": {
+                    "text": f"Answer: {r['choice']}",
+                    "latent": {"slots": []},
+                    "properties": {"regression": {}, "classification": {}},
+                    "task": {
+                        "task_name": "MoleculeQA",
+                        "task_kind": "mcq4",
+                        "label": choice_to_idx[r["choice"]],
+                        "label_text": r["choice"],
+                        "value": None,
+                    },
+                },
+                "quality": {"quality_score": None, "quality_label": "test"},
+                "meta": {"has_latent_target": False, "has_text_target": True, "has_property_target": False, "has_task_label": True},
+            }
+        )
+    print(f"[Stage1Eval] MoleculeQA: picked {len(samples)} samples from {test_json_path}")
+    return samples
+
+
+def build_pampa_eval_samples(pampa_json_path, sample_size=1000, seed=42):
+    if not os.path.exists(pampa_json_path):
+        raise FileNotFoundError(f"PAMPA file not found: {pampa_json_path}")
+    with open(pampa_json_path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+    if not isinstance(obj, dict) or "data_list" not in obj:
+        raise RuntimeError("PAMPA json should contain top-level key `data_list`.")
+    data_list = obj.get("data_list") or []
+    prompts = obj.get("prompts") or {}
+    prompt_default = prompts.get("default") or {}
+
+    rows = []
+    for i, item in enumerate(data_list):
+        if not isinstance(item, dict):
+            continue
+        smiles = item.get("smiles", "")
+        ans = item.get("answer", "")
+        if not isinstance(smiles, str) or len(smiles) == 0:
+            continue
+        ans_norm = str(ans).strip().lower()
+        if ans_norm.startswith("high"):
+            label = 1
+            label_text = "High permeability"
+        elif "low" in ans_norm:
+            label = 0
+            label_text = "Low-to-moderate permeability"
+        else:
+            continue
+        rows.append((i, smiles, label, label_text))
+    rng = random.Random(seed)
+    if sample_size is not None and sample_size > 0 and len(rows) > sample_size:
+        rows = rng.sample(rows, int(sample_size))
+
+    samples = []
+    for i, smiles, label, label_text in rows:
+        samples.append(
+            {
+                "sample_id": f"pampa_{i}",
+                "source_dataset": "PAMPA",
+                "split": "test",
+                "task_type": "downstream",
+                "stage_tags": ["stage1", "stage3"],
+                "molecule": {"smiles": smiles, "canonical_smiles": smiles, "iupac_name": None},
+                "input": {
+                    "system_prompt": prompt_default.get("system") or "You are a drug discovery assistant.",
+                    "instruction": prompt_default.get("user") or "Determine permeability.\nMolecule <mol>.",
+                    "conversation_history": [],
+                },
+                "targets": {
+                    "text": f"Final answer: {label_text}",
+                    "latent": {"slots": []},
+                    "properties": {"regression": {}, "classification": {}},
+                    "task": {
+                        "task_name": "PAMPA",
+                        "task_kind": "binary_classification",
+                        "label": label,
+                        "label_text": label_text,
+                        "value": None,
+                    },
+                },
+                "quality": {"quality_score": None, "quality_label": "test"},
+                "meta": {"has_latent_target": False, "has_text_target": True, "has_property_target": False, "has_task_label": True},
+            }
+        )
+    print(f"[Stage1Eval] PAMPA: picked {len(samples)} samples from {pampa_json_path}")
+    return samples

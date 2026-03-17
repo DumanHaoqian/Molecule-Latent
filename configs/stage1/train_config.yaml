@@ -65,6 +65,19 @@ stage1:
   eval_before_training: true
   eval_before_training_use_base_forward: true
   test_results_csv_path: "/home/haoqian/Data/Molecule/Latent/test.csv"
+  mw_warmup_start: 5.0
+  mw_warmup_end: 1.0
+  mw_warmup_steps: 2000
+  non_mw_reg_scale: 0.5
+  regression_target_stds:
+    molecular_weight: 500.0
+    logp: 5.0
+    tpsa: 150.0
+    hbd: 5.0
+    hba: 10.0
+    num_rings: 6.0
+    aromatic_ring_count: 4.0
+    qed: 1.0
   regression_targets:
     - molecular_weight
     - logp

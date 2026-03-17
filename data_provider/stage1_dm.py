@@ -6,7 +6,12 @@ from pytorch_lightning import LightningDataModule
 from torch.utils.data import BatchSampler, ConcatDataset, DataLoader, Subset
 
 from data_provider.collaters import Stage1UnifiedCollater
-from data_provider.stage1_dataset import UnifiedStage1Dataset, build_downstream_eval_samples_from_csv
+from data_provider.stage1_dataset import (
+    UnifiedStage1Dataset,
+    build_downstream_eval_samples_from_csv,
+    build_moleculeqa_eval_samples,
+    build_pampa_eval_samples,
+)
 
 
 class WeightedSourceBatchSampler(BatchSampler):
@@ -89,6 +94,11 @@ class Stage1DM(LightningDataModule):
         eval_stratified_sampling: bool = True,
         eval_sample_per_class: int = 100,
         eval_seed: int = 42,
+        eval_moleculeqa_test_path: str = "",
+        eval_moleculeqa_test_mol_path: str = "",
+        eval_moleculeqa_sample_size: int = 1000,
+        eval_pampa_path: str = "",
+        eval_pampa_sample_size: int = 1000,
         train_subset_fraction: float = 1.0,
         train_subset_fraction_by_source=None,
         train_subset_seed: int = 42,
@@ -116,6 +126,11 @@ class Stage1DM(LightningDataModule):
         self.eval_stratified_sampling = bool(eval_stratified_sampling)
         self.eval_sample_per_class = int(eval_sample_per_class)
         self.eval_seed = int(eval_seed)
+        self.eval_moleculeqa_test_path = eval_moleculeqa_test_path
+        self.eval_moleculeqa_test_mol_path = eval_moleculeqa_test_mol_path
+        self.eval_moleculeqa_sample_size = int(eval_moleculeqa_sample_size)
+        self.eval_pampa_path = eval_pampa_path
+        self.eval_pampa_sample_size = int(eval_pampa_sample_size)
         self.train_subset_fraction = float(train_subset_fraction)
         self.train_subset_fraction_by_source = dict(train_subset_fraction_by_source or {})
         self.train_subset_seed = int(train_subset_seed)
@@ -272,6 +287,23 @@ class Stage1DM(LightningDataModule):
                 sample_per_class=self.eval_sample_per_class,
                 seed=self.eval_seed,
             )
+            if isinstance(self.eval_moleculeqa_test_path, str) and len(self.eval_moleculeqa_test_path) > 0:
+                eval_samples.extend(
+                    build_moleculeqa_eval_samples(
+                        self.eval_moleculeqa_test_path,
+                        test_mol_json_path=self.eval_moleculeqa_test_mol_path,
+                        sample_size=self.eval_moleculeqa_sample_size,
+                        seed=self.eval_seed,
+                    )
+                )
+            if isinstance(self.eval_pampa_path, str) and len(self.eval_pampa_path) > 0:
+                eval_samples.extend(
+                    build_pampa_eval_samples(
+                        self.eval_pampa_path,
+                        sample_size=self.eval_pampa_sample_size,
+                        seed=self.eval_seed,
+                    )
+                )
             self.val_dataset = UnifiedStage1Dataset(
                 data_paths=[],
                 source_name="DownstreamEval",

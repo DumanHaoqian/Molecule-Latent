@@ -43,6 +43,11 @@ data:
   eval_stratified_sampling: true
   eval_sample_per_class: 100
   eval_seed: 42
+  eval_moleculeqa_test_path: "/home/haoqian/Data/Molecule/Molecule/Baselines/Mol-LLaMA/data/moleculeqa/test.json"
+  eval_moleculeqa_test_mol_path: "/home/haoqian/Data/Molecule/Molecule/Baselines/Mol-LLaMA/data/moleculeqa/test_mol.json"
+  eval_moleculeqa_sample_size: 1000
+  eval_pampa_path: "/home/haoqian/Data/Molecule/Molecule/Baselines/Mol-LLaMA/pampa/data/pampa.json"
+  eval_pampa_sample_size: 1000
 
   # Training subset control (for quick ablations/debug).
   # 1.0 means use all training data, 0.5 means use 50%.

@@ -149,10 +149,16 @@ class Stage1UnifiedCollater:
         has_property_target = property_regression_mask.any(dim=1) | property_classification_mask.any(dim=1)
         task_label = torch.full((batch_size,), -1, dtype=torch.long)
         task_label_mask = torch.zeros((batch_size,), dtype=torch.bool)
+        task_kind = []
+        task_label_text = []
+        task_regression_value = torch.zeros((batch_size,), dtype=torch.float32)
+        task_regression_mask = torch.zeros((batch_size,), dtype=torch.bool)
         task_name = []
         for bi, info in enumerate(other_infos):
             task_obj = info.get("task", {}) or {}
             task_name.append(task_obj.get("task_name"))
+            task_kind.append(task_obj.get("task_kind"))
+            task_label_text.append(task_obj.get("label_text"))
             label = task_obj.get("label")
             try:
                 if label is not None:
@@ -160,6 +166,13 @@ class Stage1UnifiedCollater:
                     if label_i in (0, 1):
                         task_label[bi] = label_i
                         task_label_mask[bi] = True
+            except (TypeError, ValueError):
+                pass
+            value = task_obj.get("value")
+            try:
+                if value is not None:
+                    task_regression_value[bi] = float(value)
+                    task_regression_mask[bi] = True
             except (TypeError, ValueError):
                 pass
 
@@ -191,4 +204,8 @@ class Stage1UnifiedCollater:
             "task_label": task_label,
             "task_label_mask": task_label_mask,
             "task_name": task_name,
+            "task_kind": task_kind,
+            "task_label_text": task_label_text,
+            "task_regression_value": task_regression_value,
+            "task_regression_mask": task_regression_mask,
         }
