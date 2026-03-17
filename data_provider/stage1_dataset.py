@@ -1,5 +1,7 @@
 import json
 import os
+import csv
+import random
 from collections import defaultdict
 
 import numpy as np
@@ -67,6 +69,7 @@ class UnifiedStage1Dataset(Dataset):
         max_latent_slots=6,
         max_atoms=512,
         use_task_tokens=True,
+        preloaded_samples=None,
     ):
         super().__init__()
         self.source_name = source_name
@@ -78,11 +81,12 @@ class UnifiedStage1Dataset(Dataset):
         self.use_task_tokens = use_task_tokens
         self.mol_prompt = "<mol><mol><mol><mol><mol><mol><mol><mol>"
         self.default_system = "You are a helpful assistant specializing in chemistry and biology."
-        self.samples = []
+        self.samples = list(preloaded_samples or [])
         if isinstance(data_paths, str):
             data_paths = [data_paths]
         self.data_paths = [p for p in (data_paths or []) if isinstance(p, str) and len(p) > 0]
-        self._load_all_samples()
+        if len(self.samples) == 0:
+            self._load_all_samples()
         if len(self.samples) == 0:
             raise RuntimeError(
                 f"UnifiedStage1Dataset(source={self.source_name}, task={self.task_type}) loaded 0 samples from {self.data_paths}"
@@ -413,3 +417,105 @@ class UnifiedStage1Dataset(Dataset):
             other_info = self._extract_other_info(sample, smiles)
             return data_graph, messages, other_info
         raise RuntimeError("Unable to fetch a valid sample after retries.")
+
+
+def _safe_binary_label(value):
+    try:
+        v = int(float(value))
+        if v in (0, 1):
+            return v
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _extract_downstream_label(row, dataset_name):
+    ds = (dataset_name or "").upper()
+    if ds == "BACE":
+        keys = ["Class", "class", "label"]
+    elif ds == "BBBP":
+        keys = ["p_np", "label"]
+    elif ds == "HIV":
+        keys = ["HIV_active", "label"]
+    elif ds == "CLINTOX":
+        keys = ["CT_TOX", "FDA_APPROVED", "label"]
+    else:
+        keys = ["label", "Class", "p_np", "HIV_active", "CT_TOX", "FDA_APPROVED"]
+    for key in keys:
+        if key in row:
+            label = _safe_binary_label(row.get(key))
+            if label is not None:
+                return label
+    return None
+
+
+def build_downstream_eval_samples_from_csv(csv_paths, sample_per_dataset=200, seed=42):
+    """
+    Build fixed downstream eval samples from csv test splits.
+    Returns unified-schema-like downstream samples used by Stage-I val loop.
+    """
+    rng = random.Random(seed)
+    all_samples = []
+    for path in csv_paths:
+        if not isinstance(path, str) or len(path) == 0:
+            continue
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Downstream eval csv not found: {path}")
+
+        dataset_name = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        rows = []
+        with open(path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for i, row in enumerate(reader):
+                smiles = (row.get("smiles") or "").strip()
+                if len(smiles) == 0:
+                    continue
+                label = _extract_downstream_label(row, dataset_name)
+                if label is None:
+                    continue
+                rows.append((i, smiles, label))
+        if len(rows) == 0:
+            raise RuntimeError(f"No valid (smiles,label) rows found in {path}")
+
+        n_pick = min(int(sample_per_dataset), len(rows))
+        picked = rng.sample(rows, n_pick) if len(rows) > n_pick else rows
+        for i, smiles, label in picked:
+            all_samples.append(
+                {
+                    "sample_id": f"{dataset_name}_test_{i}",
+                    "source_dataset": dataset_name,
+                    "split": "test",
+                    "task_type": "downstream",
+                    "stage_tags": ["stage1", "stage3"],
+                    "molecule": {
+                        "smiles": smiles,
+                        "canonical_smiles": smiles,
+                        "iupac_name": None,
+                    },
+                    "input": {
+                        "system_prompt": "You are a helpful assistant specializing in chemistry and biology.",
+                        "instruction": "Given the molecule, predict the downstream binary label.",
+                        "conversation_history": [],
+                    },
+                    "targets": {
+                        "text": "Yes" if label == 1 else "No",
+                        "latent": {"slots": []},
+                        "properties": {"regression": {}, "classification": {}},
+                        "task": {
+                            "task_name": dataset_name,
+                            "task_kind": "binary_classification",
+                            "label": label,
+                            "label_text": "Yes" if label == 1 else "No",
+                        },
+                    },
+                    "quality": {"quality_score": None, "quality_label": "test"},
+                    "meta": {
+                        "has_latent_target": False,
+                        "has_text_target": True,
+                        "has_property_target": False,
+                        "has_task_label": True,
+                    },
+                }
+            )
+        print(f"[Stage1Eval] {dataset_name}: picked {n_pick}/{len(rows)} samples from {path}")
+    return all_samples

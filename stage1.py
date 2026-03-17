@@ -100,14 +100,21 @@ def main():
         use_task_tokens=bool(_cfg_get(stage1_cfg, "use_task_tokens", getattr(train_config, "use_task_tokens", True))),
         regression_targets=list(_cfg_get(stage1_cfg, "regression_targets", getattr(train_config, "wm_regression_targets", []))),
         classification_targets=list(_cfg_get(stage1_cfg, "classification_targets", getattr(train_config, "wm_classification_targets", []))),
+        eval_downstream_csv_paths=list(_cfg_get(data_cfg, "eval_downstream_csv_paths", [])),
+        eval_sample_per_dataset=int(_cfg_get(data_cfg, "eval_sample_per_dataset", 200)),
+        eval_seed=int(_cfg_get(data_cfg, "eval_seed", 42)),
+        train_subset_fraction=float(_cfg_get(data_cfg, "train_subset_fraction", 1.0)),
+        train_subset_fraction_by_source=_to_plain(_cfg_get(data_cfg, "train_subset_fraction_by_source", {})),
+        train_subset_seed=int(_cfg_get(data_cfg, "train_subset_seed", 42)),
         seed=int(getattr(train_config, "seed", 42)),
     )
 
-    ckpt_cb = ModelCheckpoint(
+    best_ckpt_cb = ModelCheckpoint(
         dirpath=os.path.join("checkpoints", "stage1"),
-        filename="{epoch:02d}",
-        save_top_k=-1,
-        every_n_epochs=int(train_config.save_every_n_epochs),
+        filename="best-step{step:08d}-score{val_score:.4f}",
+        monitor="val/score",
+        mode="max",
+        save_top_k=1,
         save_last=True,
     )
     lr_cb = LearningRateMonitor(logging_interval="step")
@@ -141,12 +148,16 @@ def main():
         precision=train_config.precision,
         max_epochs=int(train_config.max_epochs),
         check_val_every_n_epoch=int(train_config.check_val_every_n_epoch),
+        val_check_interval=int(_cfg_get(stage1_cfg, "eval_every_n_steps", 200)),
         accumulate_grad_batches=int(train_config.accumulate_grad_batches),
-        callbacks=[ckpt_cb, lr_cb],
+        callbacks=[best_ckpt_cb, lr_cb],
         logger=loggers,
         default_root_dir=".",
         log_every_n_steps=1,
     )
+    if bool(_cfg_get(stage1_cfg, "eval_before_training", True)):
+        print("[Stage1] running pre-finetuning validation at global_step=0 ...")
+        trainer.validate(model=model, datamodule=datamodule, verbose=True)
     trainer.fit(model=model, datamodule=datamodule)
 
 

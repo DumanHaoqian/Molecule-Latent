@@ -142,6 +142,21 @@ class Stage1UnifiedCollater:
         text_targets = [messages[-1]["content"] if len(messages) > 0 else "" for messages in messages_list]
         has_latent_target = latent_slot_mask.any(dim=1)
         has_property_target = property_regression_mask.any(dim=1) | property_classification_mask.any(dim=1)
+        task_label = torch.full((batch_size,), -1, dtype=torch.long)
+        task_label_mask = torch.zeros((batch_size,), dtype=torch.bool)
+        task_name = []
+        for bi, info in enumerate(other_infos):
+            task_obj = info.get("task", {}) or {}
+            task_name.append(task_obj.get("task_name"))
+            label = task_obj.get("label")
+            try:
+                if label is not None:
+                    label_i = int(label)
+                    if label_i in (0, 1):
+                        task_label[bi] = label_i
+                        task_label_mask[bi] = True
+            except (TypeError, ValueError):
+                pass
 
         return {
             "task_type": task_type,
@@ -167,4 +182,7 @@ class Stage1UnifiedCollater:
             "meta_info": [info.get("meta", {}) for info in other_infos],
             "has_latent_target": has_latent_target,
             "has_property_target": has_property_target,
+            "task_label": task_label,
+            "task_label_mask": task_label_mask,
+            "task_name": task_name,
         }

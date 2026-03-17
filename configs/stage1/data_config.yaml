@@ -31,3 +31,18 @@ data:
     conversation: 0.1
     downstream: 0.1
 
+  eval_downstream_csv_paths:
+    - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/BACE/split/test.csv"
+    - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/BBBP/split/test.csv"
+    - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/HIV/split/test.csv"
+    - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/Clintox/split/test.csv"
+  eval_sample_per_dataset: 200
+  eval_seed: 42
+
+  # Training subset control (for quick ablations/debug).
+  # 1.0 means use all training data, 0.5 means use 50%.
+  train_subset_fraction: 0.3
+  # Optional per-source override. Keys: pubchem / conversation / downstream
+  train_subset_fraction_by_source: {}
+  train_subset_seed: 42
+

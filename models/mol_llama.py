@@ -155,8 +155,19 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
         query_output = self.llm_proj(query_output.last_hidden_state) #[batch_size,num_query_token,dim]
 
         inputs_embeds = self.llm.get_input_embeddings()(text_batch.input_ids) # [batch_size, max_len, dim]
-        inputs_embeds[text_batch.mol_token_flag] = \
-            query_output.flatten(0, 1).to(inputs_embeds.dtype) # [batch_size, max_len, dim]
+        # Robust molecule-token injection:
+        # Some conversation history may also contain "<mol>", which can make
+        # tokenized mol-placeholder counts different from num_query_tokens.
+        # We align per-sample and only fill the first min(count, num_query_tokens)
+        # positions to avoid shape mismatch at runtime.
+        mol_flag = text_batch.mol_token_flag
+        bsz, qnum, _ = query_output.shape
+        for bi in range(bsz):
+            pos = torch.nonzero(mol_flag[bi], as_tuple=False).flatten()
+            if pos.numel() == 0:
+                continue
+            use_n = min(pos.numel(), qnum)
+            inputs_embeds[bi, pos[:use_n], :] = query_output[bi, :use_n, :].to(inputs_embeds.dtype)
         return inputs_embeds
 
     def _sample_segments(self, sample_embeds, sample_labels, sample_attention):

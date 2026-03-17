@@ -1,4 +1,6 @@
 import contextlib
+import csv
+import os
 from collections import defaultdict
 
 import pytorch_lightning as pl
@@ -50,6 +52,14 @@ class Stage1Trainer(pl.LightningModule):
         self.source_counter = defaultdict(int)
         self.task_to_id = {"latent_world_modeling": 0, "conversation": 1, "downstream": 2}
         self.source_to_id = {"PubChemLatent": 0, "ComprehensiveConversation": 1, "DownstreamTasks": 2}
+        self.stage1_cfg = getattr(train_config, "stage1", {})
+        self.test_results_csv_path = str(
+            getattr(
+                self.stage1_cfg,
+                "test_results_csv_path",
+                "/home/haoqian/Data/Molecule/Latent/test.csv",
+            )
+        )
     
     def maybe_autocast(self, dtype=torch.float16):
         # if on cpu, don't use autocast
@@ -172,8 +182,99 @@ class Stage1Trainer(pl.LightningModule):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        # Stage-I mixed training currently uses train-only data by design.
-        return None
+        outputs = self.mol_llama.forward_stage1(batch)
+        lm_loss = outputs["lm_loss"] if outputs["lm_loss"] is not None else torch.tensor(0.0, device=self.device)
+        score = -lm_loss
+        batch_size = batch["input_ids"].size(0)
+        source_name = batch["source_dataset"][0] if len(batch["source_dataset"]) > 0 else "unknown"
+
+        # Downstream test accuracy (binary): compare first supervised token prediction
+        # against the first gold token at assistant target span.
+        acc = torch.tensor(0.0, device=self.device)
+        if "task_label_mask" in batch and batch["task_label_mask"].any():
+            logits = outputs["logits"]  # [B, T, V]
+            pred_ids = logits.argmax(dim=-1)  # [B, T]
+            labels = batch["labels"].to(logits.device)  # [B, T]
+            task_label = batch["task_label"].to(logits.device)
+            task_label_mask = batch["task_label_mask"].to(logits.device)
+
+            # Build shifted arrays aligned with causal LM prediction.
+            pred_shift = pred_ids[:, :-1]
+            label_shift = labels[:, 1:]
+            valid_shift = label_shift != -100
+
+            # Convert first supervised token prediction to 0/1 by matching each sample's
+            # own gold first token id: equal -> correct class token, not equal -> other class.
+            correct = torch.zeros((batch_size,), dtype=torch.bool, device=logits.device)
+            used = torch.zeros((batch_size,), dtype=torch.bool, device=logits.device)
+            for bi in range(batch_size):
+                if not bool(task_label_mask[bi]):
+                    continue
+                pos = torch.nonzero(valid_shift[bi], as_tuple=False).flatten()
+                if pos.numel() == 0:
+                    continue
+                first_pos = int(pos[0].item())
+                pred_tok = pred_shift[bi, first_pos]
+                gold_tok = label_shift[bi, first_pos]
+                pred_label = 1 if int(pred_tok.item()) == int(gold_tok.item()) else 0
+                correct[bi] = int(pred_label) == int(task_label[bi].item())
+                used[bi] = True
+
+            if used.any():
+                acc = correct[used].float().mean()
+
+        self.log("val/loss", lm_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log("val/score", score, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log("val/acc", acc, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log(f"val/loss_{source_name}", lm_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log(f"val/score_{source_name}", score, on_step=False, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log(f"val/acc_{source_name}", acc, on_step=False, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
+        return {"val_loss": lm_loss.detach(), "val_score": score.detach(), "val_acc": acc.detach()}
+
+    def on_validation_epoch_end(self):
+        if self.trainer.sanity_checking:
+            return
+        if not self.trainer.is_global_zero:
+            return
+
+        metrics = self.trainer.callback_metrics
+
+        def _to_float(key, default=0.0):
+            v = metrics.get(key, default)
+            if hasattr(v, "detach"):
+                v = v.detach()
+            if hasattr(v, "item"):
+                v = v.item()
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return float(default)
+
+        row = {
+            "global_step": int(self.global_step),
+            "epoch": int(self.current_epoch),
+            "val_loss": _to_float("val/loss", 0.0),
+            "val_score": _to_float("val/score", 0.0),
+            "val_acc": _to_float("val/acc", 0.0),
+            "val_score_BACE": _to_float("val/score_BACE", 0.0),
+            "val_score_BBBP": _to_float("val/score_BBBP", 0.0),
+            "val_score_HIV": _to_float("val/score_HIV", 0.0),
+            "val_score_Clintox": _to_float("val/score_Clintox", 0.0),
+            "val_acc_BACE": _to_float("val/acc_BACE", 0.0),
+            "val_acc_BBBP": _to_float("val/acc_BBBP", 0.0),
+            "val_acc_HIV": _to_float("val/acc_HIV", 0.0),
+            "val_acc_Clintox": _to_float("val/acc_Clintox", 0.0),
+        }
+
+        csv_path = self.test_results_csv_path
+        os.makedirs(os.path.dirname(csv_path), exist_ok=True)
+        file_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
+        with open(csv_path, "a", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
+        print(f"[Stage1Eval] wrote test metrics to {csv_path}: {row}")
 
     def on_train_epoch_end(self):
         total = sum(self.source_counter.values())

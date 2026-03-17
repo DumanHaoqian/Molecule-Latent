@@ -38,8 +38,8 @@ source_sampling_weights:
 
 loss_weights:
   latent: 1.0
-  wm: 1.0
-  lm: 0.1
+  wm: 0.01
+  lm: 1
   conv_lm: 1.0
   downstream_lm: 1.0
 
@@ -61,6 +61,9 @@ stage1:
   max_latent_slots: 6
   use_task_tokens: true
   use_mixed_stage1_training: true
+  eval_every_n_steps: 200
+  eval_before_training: true
+  test_results_csv_path: "/home/haoqian/Data/Molecule/Latent/test.csv"
   regression_targets:
     - molecular_weight
     - logp

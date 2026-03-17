@@ -11,6 +11,9 @@ lightning_logs/
 ## Wandb
 wandb/
 
+## Logs
+logs/
+
 ## Playground Files
 playground_inputs.json
 playground_outputs.json

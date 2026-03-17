@@ -3,10 +3,10 @@ from typing import Dict
 import os
 import torch
 from pytorch_lightning import LightningDataModule
-from torch.utils.data import BatchSampler, ConcatDataset, DataLoader
+from torch.utils.data import BatchSampler, ConcatDataset, DataLoader, Subset
 
 from data_provider.collaters import Stage1UnifiedCollater
-from data_provider.stage1_dataset import UnifiedStage1Dataset
+from data_provider.stage1_dataset import UnifiedStage1Dataset, build_downstream_eval_samples_from_csv
 
 
 class WeightedSourceBatchSampler(BatchSampler):
@@ -84,6 +84,12 @@ class Stage1DM(LightningDataModule):
         use_task_tokens: bool = True,
         regression_targets=None,
         classification_targets=None,
+        eval_downstream_csv_paths=None,
+        eval_sample_per_dataset: int = 200,
+        eval_seed: int = 42,
+        train_subset_fraction: float = 1.0,
+        train_subset_fraction_by_source=None,
+        train_subset_seed: int = 42,
         seed: int = 42,
     ):
         super().__init__()
@@ -101,6 +107,14 @@ class Stage1DM(LightningDataModule):
         self.use_task_tokens = use_task_tokens
         self.regression_targets = list(regression_targets or [])
         self.classification_targets = list(classification_targets or [])
+        if isinstance(eval_downstream_csv_paths, str):
+            eval_downstream_csv_paths = [eval_downstream_csv_paths]
+        self.eval_downstream_csv_paths = list(eval_downstream_csv_paths or [])
+        self.eval_sample_per_dataset = int(eval_sample_per_dataset)
+        self.eval_seed = int(eval_seed)
+        self.train_subset_fraction = float(train_subset_fraction)
+        self.train_subset_fraction_by_source = dict(train_subset_fraction_by_source or {})
+        self.train_subset_seed = int(train_subset_seed)
 
         self.latent_world_modeling_path = latent_world_modeling_path
         self.conversation_sft_path = conversation_sft_path
@@ -117,6 +131,7 @@ class Stage1DM(LightningDataModule):
 
         self.train_dataset = None
         self.train_batch_sampler = None
+        self.val_dataset = None
 
     def _resolve_source_paths(self):
         resolved = {"pubchem": [], "conversation": [], "downstream": []}
@@ -195,6 +210,33 @@ class Stage1DM(LightningDataModule):
         if len(datasets) == 0:
             raise ValueError("No stage1 unified dataset path provided.")
 
+        # Optional train subset control: keep only a fraction of each source.
+        # Useful for fast ablations (e.g. 50% training data).
+        if self.train_subset_fraction < 1.0 or len(self.train_subset_fraction_by_source) > 0:
+            print(
+                f"[Stage1DM] applying train subset: global_fraction={self.train_subset_fraction}, "
+                f"per_source={self.train_subset_fraction_by_source}, seed={self.train_subset_seed}"
+            )
+            g = torch.Generator()
+            g.manual_seed(self.train_subset_seed)
+            reduced = {}
+            for source, ds in datasets.items():
+                frac = float(self.train_subset_fraction_by_source.get(source, self.train_subset_fraction))
+                frac = max(0.0, min(1.0, frac))
+                n_total = len(ds)
+                if frac >= 1.0:
+                    reduced[source] = ds
+                    print(f"[Stage1DM] subset source={source}: keep {n_total}/{n_total} (1.0)")
+                    continue
+                if n_total <= 1 or frac <= 0.0:
+                    keep_n = 1
+                else:
+                    keep_n = max(1, int(n_total * frac))
+                indices = torch.randperm(n_total, generator=g)[:keep_n].tolist()
+                reduced[source] = Subset(ds, indices)
+                print(f"[Stage1DM] subset source={source}: keep {keep_n}/{n_total} ({frac:.3f})")
+            datasets = reduced
+
         self._source_datasets = datasets
         self._source_names = list(datasets.keys())
         concat_parts = [datasets[k] for k in self._source_names]
@@ -218,6 +260,24 @@ class Stage1DM(LightningDataModule):
         print(f"[Stage1DM] source weights: {self.source_sampling_weights}")
         print(f"[Stage1DM] steps_per_epoch: {approx_total_batches}")
 
+        if len(self.eval_downstream_csv_paths) > 0:
+            eval_samples = build_downstream_eval_samples_from_csv(
+                self.eval_downstream_csv_paths,
+                sample_per_dataset=self.eval_sample_per_dataset,
+                seed=self.eval_seed,
+            )
+            self.val_dataset = UnifiedStage1Dataset(
+                data_paths=[],
+                source_name="DownstreamEval",
+                task_type="downstream",
+                unimol_dictionary=self.unimol_dictionary,
+                encoder_types=self.encoder_types,
+                max_latent_slots=self.max_latent_slots,
+                use_task_tokens=self.use_task_tokens,
+                preloaded_samples=eval_samples,
+            )
+            print(f"[Stage1DM] downstream eval size: {len(self.val_dataset)}")
+
     def train_dataloader(self):
         collate = Stage1UnifiedCollater(
             tokenizer=self.tokenizer,
@@ -236,5 +296,29 @@ class Stage1DM(LightningDataModule):
             num_workers=self.num_workers,
             pin_memory=False,
             persistent_workers=self.num_workers > 0,
+            collate_fn=collate,
+        )
+
+    def val_dataloader(self):
+        if self.val_dataset is None:
+            return None
+        collate = Stage1UnifiedCollater(
+            tokenizer=self.tokenizer,
+            llama_version=self.llama_version,
+            pad_idx=self.unimol_dictionary.pad(),
+            encoder_types=self.encoder_types,
+            max_latent_slots=self.max_latent_slots,
+            latent_slot_text_max_len=self.latent_slot_text_max_len,
+            text_max_len=self.text_max_len,
+            regression_targets=self.regression_targets,
+            classification_targets=self.classification_targets,
+        )
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=False,
+            persistent_workers=False,
             collate_fn=collate,
         )
