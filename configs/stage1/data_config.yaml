@@ -1,5 +1,9 @@
 num_workers: 8
-batch_size: 16
+batch_size: 2
 text_max_len: 512
-root: data/Mol-LLaMA-Instruct/
+root: ""
+
+latent_world_modeling_path: /home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/latent_world_modeling.jsonl
+conversation_sft_path: /home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/conversation_sft.jsonl
+downstream_tasks_path: /home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/downstream_tasks.jsonl
 

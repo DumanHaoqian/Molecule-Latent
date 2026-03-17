@@ -103,6 +103,17 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
         self.subregion_proj = nn.Linear(self.llm.config.hidden_size, self.llm.config.hidden_size)
         self.latent_cls_head = nn.Linear(self.llm.config.hidden_size, 2)
 
+        # Stage-I unified training heads (lightweight and optional).
+        self.stage1_max_latent_slots = 6
+        self.stage1_slot_queries = nn.Parameter(
+            torch.randn(1, self.stage1_max_latent_slots, self.llm.config.hidden_size) * 0.02
+        )
+        self.stage1_slot_target_proj = nn.Linear(self.llm.config.hidden_size, self.llm.config.hidden_size)
+        self.stage1_wm_reg_keys = ["molecular_weight", "logp", "tpsa", "hbd", "hba", "num_rings", "aromatic_ring_count", "qed"]
+        self.stage1_wm_cls_keys = ["ro5_pass", "ro5_violation_count"]
+        self.stage1_wm_reg_head = nn.Linear(self.llm.config.hidden_size, len(self.stage1_wm_reg_keys))
+        self.stage1_wm_cls_head = nn.Linear(self.llm.config.hidden_size, len(self.stage1_wm_cls_keys))
+
     def postprocess_encoder(self):
         self.encoder.Qformer.cls = None
         self.encoder.Qformer.bert.embeddings.word_embeddings = None
@@ -306,6 +317,74 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
             "loss_lm": loss_lm.detach(),
             "loss_latent": loss_latent.detach(),
             "loss_cls": loss_cls.detach(),
+        }
+
+    def forward_stage1(self, batch):
+        """
+        Stage-I unified forward.
+        Returns a dict with lm_loss / latent_states / wm_preds and required
+        tensors for trainer-side task-aware loss routing.
+        """
+        graph_batch = batch["graph_batch"]
+        # Build a minimal text batch object to reuse existing multimodal injection.
+        class _TextBatch:
+            pass
+        text_batch = _TextBatch()
+        text_batch.input_ids = batch["input_ids"]
+        text_batch.attention_mask = batch["attention_mask"]
+        text_batch.labels = batch["labels"]
+        text_batch.mol_token_flag = batch["mol_token_flag"]
+
+        inputs_embeds = self._build_prefill_inputs_embeds(graph_batch, text_batch)
+        llm_out = self.llm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=text_batch.attention_mask,
+            labels=text_batch.labels,
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False,
+        )
+
+        # Latent states from molecular query tokens (lightweight first runnable version).
+        _, _, query_output = self.encoder.graph_forward(graph_batch)
+        query_states = self.llm_proj(query_output.last_hidden_state)  # [B, Q, H]
+        qlen = query_states.shape[1]
+        max_slots = min(self.stage1_max_latent_slots, qlen)
+        latent_states = query_states[:, :max_slots, :]
+        if max_slots < self.stage1_max_latent_slots:
+            pad = torch.zeros(
+                (query_states.shape[0], self.stage1_max_latent_slots - max_slots, query_states.shape[-1]),
+                device=query_states.device,
+                dtype=query_states.dtype,
+            )
+            latent_states = torch.cat([latent_states, pad], dim=1)
+
+        pooled_latent = latent_states.mean(dim=1)
+        wm_reg_preds = self.stage1_wm_reg_head(pooled_latent)
+        wm_cls_logits = self.stage1_wm_cls_head(pooled_latent)
+
+        # Slot target embedding from slot descriptor tokens (tokenized by collater).
+        model_device = next(self.parameters()).device
+        slot_ids = batch["latent_slot_input_ids"].to(model_device)  # [B, K, L]
+        slot_attn = batch["latent_slot_attention_mask"].to(model_device)  # [B, K, L]
+        bsz, ksz, slen = slot_ids.shape
+        slot_emb = self.llm.get_input_embeddings()(slot_ids.view(bsz * ksz, slen))
+        slot_mask = slot_attn.view(bsz * ksz, slen).unsqueeze(-1).to(slot_emb.dtype)
+        slot_den = slot_mask.sum(dim=1).clamp(min=1.0)
+        slot_pooled = (slot_emb * slot_mask).sum(dim=1) / slot_den
+        slot_targets = self.stage1_slot_target_proj(slot_pooled).view(bsz, ksz, -1)
+
+        return {
+            "logits": llm_out.logits,
+            "lm_loss": llm_out.loss,
+            "latent_states": latent_states,
+            "slot_targets": slot_targets,
+            "wm_preds": {
+                "regression": wm_reg_preds,
+                "classification_logits": wm_cls_logits,
+                "regression_keys": self.stage1_wm_reg_keys,
+                "classification_keys": self.stage1_wm_cls_keys,
+            },
         }
 
     @torch.no_grad()
