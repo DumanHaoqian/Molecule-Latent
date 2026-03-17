@@ -439,6 +439,23 @@ def _extract_downstream_label(row, dataset_name):
         keys = ["HIV_active", "label"]
     elif ds == "CLINTOX":
         keys = ["CT_TOX", "FDA_APPROVED", "label"]
+    elif ds == "TOX21":
+        tox21_cols = [
+            "NR-AR", "NR-AR-LBD", "NR-AhR", "NR-Aromatase", "NR-ER", "NR-ER-LBD",
+            "NR-PPAR-gamma", "SR-ARE", "SR-ATAD5", "SR-HSE", "SR-MMP", "SR-p53",
+        ]
+        vals = []
+        for k in tox21_cols:
+            if k in row:
+                try:
+                    vals.append(float(row.get(k)))
+                except (TypeError, ValueError):
+                    pass
+        if len(vals) > 0:
+            # Convert multi-task tox21 to a binary proxy for stage-I evaluation:
+            # active if any endpoint is positive.
+            return 1 if any(v > 0.5 for v in vals) else 0
+        keys = ["label"]
     else:
         keys = ["label", "Class", "p_np", "HIV_active", "CT_TOX", "FDA_APPROVED"]
     for key in keys:
@@ -447,6 +464,22 @@ def _extract_downstream_label(row, dataset_name):
             if label is not None:
                 return label
     return None
+
+
+def _extract_downstream_regression_value(row, dataset_name):
+    ds = (dataset_name or "").upper()
+    if ds == "DELANEY":
+        key = "measured log solubility in mols per litre"
+    elif ds == "LIPO":
+        key = "exp"
+    else:
+        return None
+    if key not in row:
+        return None
+    try:
+        return float(row.get(key))
+    except (TypeError, ValueError):
+        return None
 
 
 def build_downstream_eval_samples_from_csv(
@@ -477,14 +510,16 @@ def build_downstream_eval_samples_from_csv(
                 if len(smiles) == 0:
                     continue
                 label = _extract_downstream_label(row, dataset_name)
-                if label is None:
+                reg_value = _extract_downstream_regression_value(row, dataset_name)
+                if label is None and reg_value is None:
                     continue
-                rows.append((i, smiles, label))
+                rows.append((i, smiles, label, reg_value))
         if len(rows) == 0:
             raise RuntimeError(f"No valid (smiles,label) rows found in {path}")
 
         n_pick = min(int(sample_per_dataset), len(rows))
-        if stratified_sampling:
+        can_stratify = stratified_sampling and any(x[2] is not None for x in rows)
+        if can_stratify:
             pos_rows = [x for x in rows if x[2] == 1]
             neg_rows = [x for x in rows if x[2] == 0]
             target_each = int(sample_per_class) if sample_per_class is not None else max(1, n_pick // 2)
@@ -499,12 +534,12 @@ def build_downstream_eval_samples_from_csv(
             # If one class is insufficient, fill remainder from the unused pool.
             remain = n_pick - len(picked)
             if remain > 0:
-                picked_set = set((i, s, y) for i, s, y in picked)
-                remain_pool = [x for x in rows if (x[0], x[1], x[2]) not in picked_set]
+                picked_set = set((i, s, y, r) for i, s, y, r in picked)
+                remain_pool = [x for x in rows if (x[0], x[1], x[2], x[3]) not in picked_set]
                 if len(remain_pool) > 0:
                     extra_n = min(remain, len(remain_pool))
                     picked.extend(rng.sample(remain_pool, extra_n) if len(remain_pool) > extra_n else remain_pool)
-            pos_n = sum(1 for _, _, y in picked if y == 1)
+            pos_n = sum(1 for _, _, y, _ in picked if y == 1)
             neg_n = len(picked) - pos_n
             print(
                 f"[Stage1Eval] {dataset_name}: stratified target(pos={target_each},neg={target_each}), "
@@ -512,10 +547,18 @@ def build_downstream_eval_samples_from_csv(
             )
         else:
             picked = rng.sample(rows, n_pick) if len(rows) > n_pick else rows
-            pos_n = sum(1 for _, _, y in picked if y == 1)
+            pos_n = sum(1 for _, _, y, _ in picked if y == 1)
             neg_n = len(picked) - pos_n
             print(f"[Stage1Eval] {dataset_name}: random sample actual(pos={pos_n},neg={neg_n}), total={len(picked)}")
-        for i, smiles, label in picked:
+        for i, smiles, label, reg_value in picked:
+            if label in (0, 1):
+                label_text = "Yes" if label == 1 else "No"
+                task_kind = "binary_classification"
+                text_target = label_text
+            else:
+                label_text = None
+                task_kind = "regression"
+                text_target = f"{reg_value:.6f}" if reg_value is not None else ""
             all_samples.append(
                 {
                     "sample_id": f"{dataset_name}_test_{i}",
@@ -534,14 +577,14 @@ def build_downstream_eval_samples_from_csv(
                         "conversation_history": [],
                     },
                     "targets": {
-                        "text": "Yes" if label == 1 else "No",
+                        "text": text_target,
                         "latent": {"slots": []},
                         "properties": {"regression": {}, "classification": {}},
                         "task": {
                             "task_name": dataset_name,
-                            "task_kind": "binary_classification",
+                            "task_kind": task_kind,
                             "label": label,
-                            "label_text": "Yes" if label == 1 else "No",
+                            "label_text": label_text,
                         },
                     },
                     "quality": {"quality_score": None, "quality_label": "test"},
@@ -549,7 +592,7 @@ def build_downstream_eval_samples_from_csv(
                         "has_latent_target": False,
                         "has_text_target": True,
                         "has_property_target": False,
-                        "has_task_label": True,
+                        "has_task_label": label in (0, 1),
                     },
                 }
             )

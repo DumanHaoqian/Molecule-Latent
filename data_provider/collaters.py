@@ -98,6 +98,7 @@ class Stage1UnifiedCollater:
         # latent slot descriptors -> tokenized targets for latent alignment
         latent_slot_mask = torch.zeros((batch_size, self.max_latent_slots), dtype=torch.bool)
         flat_slot_desc = []
+        latent_slot_smiles = [["" for _ in range(self.max_latent_slots)] for _ in range(batch_size)]
         for bi, info in enumerate(other_infos):
             slots = info.get("latent_slots", [])
             if not isinstance(slots, list):
@@ -106,6 +107,10 @@ class Stage1UnifiedCollater:
                 if si < len(slots):
                     latent_slot_mask[bi, si] = True
                     flat_slot_desc.append(self._slot_descriptor(slots[si]))
+                    value = slots[si].get("value", {}) if isinstance(slots[si], dict) else {}
+                    if isinstance(value, dict):
+                        smi = value.get("smiles", "")
+                        latent_slot_smiles[bi][si] = smi if isinstance(smi, str) else ""
                 else:
                     flat_slot_desc.append("")
         slot_tokens = self.tokenizer(
@@ -172,6 +177,7 @@ class Stage1UnifiedCollater:
             "latent_slot_mask": latent_slot_mask,
             "latent_slot_input_ids": latent_slot_input_ids,
             "latent_slot_attention_mask": latent_slot_attention_mask,
+            "latent_slot_smiles": latent_slot_smiles,
             "property_regression_targets": property_regression_targets,
             "property_regression_mask": property_regression_mask,
             "property_classification_targets": property_classification_targets,

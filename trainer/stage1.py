@@ -7,6 +7,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 from torch import optim
+from typing import Any, Dict
 
 from models.mol_llama import MolLLaMA
 from trainer.optims import LinearWarmupCosineLRScheduler
@@ -84,6 +85,21 @@ class Stage1Trainer(pl.LightningModule):
         else:
             raise NotImplementedError()
         return optimizer
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        # Reduce checkpoint size for frequent eval/checkpoint cycles.
+        # Keep behavior aligned with Stage2Trainer: drop optimizer states and
+        # save only trainable parameters.
+        checkpoint.pop("optimizer_states", None)
+        to_be_removed = []
+        for key in list(checkpoint.get("state_dict", {}).keys()):
+            try:
+                if not self.get_parameter(key).requires_grad:
+                    to_be_removed.append(key)
+            except Exception:
+                to_be_removed.append(key)
+        for key in to_be_removed:
+            checkpoint["state_dict"].pop(key, None)
 
     def load_from_hf_dir(self, hf_dir):
         self.mol_llama.load_from_hf_dir(hf_dir)
@@ -279,23 +295,42 @@ class Stage1Trainer(pl.LightningModule):
             "val_loss": _to_float("val/loss", 0.0),
             "val_score": _to_float("val/score", 0.0),
             "val_acc": _to_float("val/acc", 0.0),
-            "val_score_BACE": _to_float("val/score_BACE", 0.0),
-            "val_score_BBBP": _to_float("val/score_BBBP", 0.0),
-            "val_score_HIV": _to_float("val/score_HIV", 0.0),
-            "val_score_Clintox": _to_float("val/score_Clintox", 0.0),
-            "val_acc_BACE": _to_float("val/acc_BACE", 0.0),
-            "val_acc_BBBP": _to_float("val/acc_BBBP", 0.0),
-            "val_acc_HIV": _to_float("val/acc_HIV", 0.0),
-            "val_acc_Clintox": _to_float("val/acc_Clintox", 0.0),
         }
+        # Add dynamic per-dataset val metrics (e.g. BACE/BBBP/HIV/Clintox/Delaney/LIPO/Tox21).
+        for k in list(metrics.keys()):
+            if not isinstance(k, str):
+                continue
+            if k.startswith("val/score_") or k.startswith("val/acc_") or k.startswith("val/loss_"):
+                row[k.replace("/", "_")] = _to_float(k, 0.0)
 
         csv_path = self.test_results_csv_path
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)
         file_exists = os.path.exists(csv_path) and os.path.getsize(csv_path) > 0
-        with open(csv_path, "a", encoding="utf-8", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-            if not file_exists:
-                writer.writeheader()
+        fieldnames = list(row.keys())
+        existing_rows = []
+        if file_exists:
+            with open(csv_path, "r", encoding="utf-8", newline="") as f:
+                reader = csv.DictReader(f)
+                old_fields = reader.fieldnames or []
+                for old in old_fields:
+                    if old not in fieldnames:
+                        fieldnames.append(old)
+                for new_k in fieldnames:
+                    if new_k not in old_fields:
+                        old_fields.append(new_k)
+                for r in reader:
+                    for k2 in fieldnames:
+                        if k2 not in r:
+                            r[k2] = ""
+                    existing_rows.append(r)
+        for k2 in fieldnames:
+            if k2 not in row:
+                row[k2] = ""
+        with open(csv_path, "w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for r in existing_rows:
+                writer.writerow(r)
             writer.writerow(row)
         print(f"[Stage1Eval] wrote test metrics to {csv_path}: {row}")
 

@@ -124,6 +124,8 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
         self.latent_cls_head = nn.Linear(self.llm.config.hidden_size, 2)
 
         # Stage-I unified training heads (lightweight and optional).
+        # stage1_max_latent_slots means max number of subgraph-aligned latent slots.
+        # Stage-I latent reasoning uses 1 extra global latent token.
         self.stage1_max_latent_slots = int(stage1_max_latent_slots)
         self.stage1_slot_queries = nn.Parameter(
             torch.randn(1, self.stage1_max_latent_slots, self.llm.config.hidden_size) * 0.02
@@ -192,7 +194,9 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
         suffix_labels = sample_labels[first_label_idx:end]
         return prefix_embeds, suffix_embeds, suffix_labels
 
-    def _rollout_latent_tokens(self, prefix_embeds):
+    def _rollout_latent_tokens(self, prefix_embeds, num_steps=None):
+        if num_steps is None:
+            num_steps = self.num_latent_steps
         prefix_attn = torch.ones((1, prefix_embeds.shape[0]), device=prefix_embeds.device, dtype=torch.long)
         prefill_out = self.llm(
             inputs_embeds=prefix_embeds.unsqueeze(0),
@@ -209,7 +213,7 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
 
         latent_tokens = []
         rolling_attn = prefix_attn
-        for _ in range(self.num_latent_steps):
+        for _ in range(num_steps):
             proj_in = current_hidden.to(self.latent_proj.weight.dtype)
             latent_token = self.latent_norm(self.latent_proj(proj_in)).to(current_hidden.dtype)  # [1, D]
             latent_tokens.append(latent_token.squeeze(0))
@@ -231,6 +235,13 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
             past_key_values = step_out.past_key_values
 
         return torch.stack(latent_tokens, dim=0)  # [K, D]
+
+    def _extract_valid_prefix_embeds(self, sample_embeds, sample_attention):
+        valid_positions = torch.nonzero(sample_attention > 0, as_tuple=False).flatten()
+        assert valid_positions.numel() > 0, "Empty sequence after padding removal."
+        start = valid_positions[0].item()
+        end = valid_positions[-1].item() + 1
+        return sample_embeds[start:end]
 
     def _encode_subregion_smiles(self, candidate_smiles):
         if not isinstance(candidate_smiles, list) or len(candidate_smiles) == 0:
@@ -380,30 +391,81 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
             use_cache=False,
         )
 
-        # Stage-I latent states: derive a fixed number of slots from LLM hidden states.
-        hidden = llm_out.hidden_states[-1]  # [B, T, H]
-        hidden_mask = text_batch.attention_mask.unsqueeze(-1).to(hidden.dtype)
-        hidden_mean = (hidden * hidden_mask).sum(dim=1, keepdim=True) / hidden_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
-        latent_states = self.stage1_slot_queries.expand(hidden.shape[0], -1, -1) + hidden_mean
+        # Stage-I latent reasoning rollout:
+        # hidden -> latent token embedding -> feed back as next token embedding for K steps.
+        # K = 1 (global latent token) + max_subgraph_slots.
+        max_subgraph_slots = batch["latent_slot_input_ids"].shape[1]
+        total_latent_steps = 1 + max_subgraph_slots
+        latent_tokens_all = []
+        for bi in range(inputs_embeds.shape[0]):
+            prefix_embeds = self._extract_valid_prefix_embeds(inputs_embeds[bi], text_batch.attention_mask[bi])
+            # [K_total, H], first token is global latent token.
+            latent_seq = self._rollout_latent_tokens(prefix_embeds, num_steps=total_latent_steps)
+            latent_tokens_all.append(latent_seq)
+        latent_tokens_all = torch.stack(latent_tokens_all, dim=0)  # [B, K_total, H]
+        global_latent_state = latent_tokens_all[:, 0, :]  # [B, H]
+        latent_states = latent_tokens_all[:, 1:, :]       # [B, K_subgraph, H]
         latent_states = self.stage1_hidden_to_latent(latent_states)
 
-        pooled_latent = latent_states.mean(dim=1)
-        wm_preds = self.stage1_wm_head(pooled_latent)
+        # World modeling uses the global latent token.
+        wm_preds = self.stage1_wm_head(global_latent_state)
 
-        # Slot target embedding from slot descriptor tokens (tokenized by collater).
+        # Slot target embedding:
+        # Prefer graph-based subgraph feature encoding from slot smiles (closer to
+        # "latent token <-> subgraph feature" objective), fallback to descriptor text.
         model_device = next(self.parameters()).device
-        slot_ids = batch["latent_slot_input_ids"].to(model_device)  # [B, K, L]
-        slot_attn = batch["latent_slot_attention_mask"].to(model_device)  # [B, K, L]
-        bsz, ksz, slen = slot_ids.shape
-        slot_emb = self.llm.get_input_embeddings()(slot_ids.view(bsz * ksz, slen))
-        slot_mask = slot_attn.view(bsz * ksz, slen).unsqueeze(-1).to(slot_emb.dtype)
-        slot_den = slot_mask.sum(dim=1).clamp(min=1.0)
-        slot_pooled = (slot_emb * slot_mask).sum(dim=1) / slot_den
-        slot_targets = self.stage1_slot_target_proj(slot_pooled).view(bsz, ksz, -1)
+        slot_mask_batch = batch["latent_slot_mask"].to(model_device)  # [B, K]
+        slot_smiles_2d = batch.get("latent_slot_smiles", None)
+        bsz, ksz = slot_mask_batch.shape
+        slot_targets = torch.zeros(
+            (bsz, ksz, self.llm.config.hidden_size),
+            device=model_device,
+            dtype=inputs_embeds.dtype,
+        )
+        encoded_any = False
+        if isinstance(slot_smiles_2d, list):
+            flat_smiles = []
+            flat_pos = []
+            for bi in range(bsz):
+                for si in range(ksz):
+                    if not bool(slot_mask_batch[bi, si]):
+                        continue
+                    smi = ""
+                    try:
+                        smi = slot_smiles_2d[bi][si]
+                    except Exception:
+                        smi = ""
+                    if isinstance(smi, str) and len(smi) > 0:
+                        flat_smiles.append(smi)
+                        flat_pos.append((bi, si))
+            if len(flat_smiles) > 0:
+                try:
+                    dictionary = getattr(self.encoder, "unimol_dictionary", None)
+                    slot_graph_batch = get_mol_graphs(flat_smiles, dictionary, model_device)
+                    _, _, slot_query_out = self.encoder.graph_forward(slot_graph_batch)
+                    slot_feats = self.llm_proj(slot_query_out.last_hidden_state).mean(dim=1)  # [N, H]
+                    slot_feats = self.stage1_slot_target_proj(slot_feats)
+                    for idx, (bi, si) in enumerate(flat_pos):
+                        slot_targets[bi, si, :] = slot_feats[idx].to(slot_targets.dtype)
+                    encoded_any = True
+                except Exception:
+                    encoded_any = False
+
+        if not encoded_any:
+            slot_ids = batch["latent_slot_input_ids"].to(model_device)  # [B, K, L]
+            slot_attn = batch["latent_slot_attention_mask"].to(model_device)  # [B, K, L]
+            _, _, slen = slot_ids.shape
+            slot_emb = self.llm.get_input_embeddings()(slot_ids.view(bsz * ksz, slen))
+            slot_mask = slot_attn.view(bsz * ksz, slen).unsqueeze(-1).to(slot_emb.dtype)
+            slot_den = slot_mask.sum(dim=1).clamp(min=1.0)
+            slot_pooled = (slot_emb * slot_mask).sum(dim=1) / slot_den
+            slot_targets = self.stage1_slot_target_proj(slot_pooled).view(bsz, ksz, -1)
 
         return {
             "logits": llm_out.logits,
             "lm_loss": llm_out.loss,
+            "global_latent_state": global_latent_state,
+            "latent_states_all": latent_tokens_all,
             "latent_states": latent_states,
             "slot_targets": slot_targets,
             "wm_preds": wm_preds,

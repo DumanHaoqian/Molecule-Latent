@@ -1,5 +1,5 @@
 num_workers: 8
-batch_size: 2
+batch_size: 4
 text_max_len: 512
 root: ""
 
@@ -9,7 +9,7 @@ downstream_tasks_path: /home/haoqian/Data/Molecule/Construction/Datasets/unified
 
 data:
   num_workers: 8
-  batch_size: 2
+  batch_size: 4
   text_max_len: 512
 
   latent_path: "/home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/latent_world_modeling.jsonl"
@@ -36,6 +36,9 @@ data:
     - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/BBBP/split/test.csv"
     - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/HIV/split/test.csv"
     - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/Clintox/split/test.csv"
+    - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/Delaney/split/test.csv"
+    - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/LIPO/split/test.csv"
+    - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/Tox21/split/test.csv"
   eval_sample_per_dataset: 200
   eval_stratified_sampling: true
   eval_sample_per_class: 100
