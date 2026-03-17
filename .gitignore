@@ -1,0 +1,16 @@
+## Benchmark Files
+Benchmark/
+Datasets/
+
+## Checkpoints
+checkpoints/
+
+## Lightning Logs
+lightning_logs/
+
+## Wandb
+wandb/
+
+## Playground Files
+playground_inputs.json
+playground_outputs.json

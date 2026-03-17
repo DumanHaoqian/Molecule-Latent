@@ -1,0 +1,8 @@
+num_workers: 8
+batch_size: 4
+root: ""
+data_types: []
+train_json_path: Datasets/BBBP/bbbp_latent_reasoning_train.jsonl
+valid_json_path: Datasets/BBBP/bbbp_latent_reasoning_valid.jsonl
+test_json_path: Datasets/BBBP/bbbp_latent_reasoning_test.jsonl
+
