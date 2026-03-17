@@ -159,7 +159,9 @@ def main():
     )
     if bool(_cfg_get(stage1_cfg, "eval_before_training", True)):
         print("[Stage1] running pre-finetuning validation at global_step=0 ...")
+        model.use_base_forward_for_validation = bool(_cfg_get(stage1_cfg, "eval_before_training_use_base_forward", True))
         trainer.validate(model=model, datamodule=datamodule, verbose=True)
+        model.use_base_forward_for_validation = False
     trainer.fit(model=model, datamodule=datamodule)
 
 

@@ -63,6 +63,7 @@ class Stage1Trainer(pl.LightningModule):
         )
         self.val_pos_token_id = None
         self.val_neg_token_id = None
+        self.use_base_forward_for_validation = False
     
     def maybe_autocast(self, dtype=torch.float16):
         # if on cpu, don't use autocast
@@ -200,7 +201,10 @@ class Stage1Trainer(pl.LightningModule):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        outputs = self.mol_llama.forward_stage1(batch)
+        if self.use_base_forward_for_validation:
+            outputs = self.mol_llama.forward_stage1_base(batch)
+        else:
+            outputs = self.mol_llama.forward_stage1(batch)
         lm_loss = outputs["lm_loss"] if outputs["lm_loss"] is not None else torch.tensor(0.0, device=self.device)
         score = -lm_loss
         batch_size = batch["input_ids"].size(0)

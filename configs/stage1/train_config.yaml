@@ -63,6 +63,7 @@ stage1:
   use_mixed_stage1_training: true
   eval_every_n_steps: 500
   eval_before_training: true
+  eval_before_training_use_base_forward: true
   test_results_csv_path: "/home/haoqian/Data/Molecule/Latent/test.csv"
   regression_targets:
     - molecular_weight
@@ -79,5 +80,5 @@ stage1:
 
 use_wandb: True
 wandb_mode: online
-wandb_project: latent-wm-v1
-wandb_run_name: latent-wm-v1
+wandb_project: latent-wm-v2
+wandb_run_name: latent-wm-v2

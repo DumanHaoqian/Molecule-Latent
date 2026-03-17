@@ -471,6 +471,48 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
             "wm_preds": wm_preds,
         }
 
+    def forward_stage1_base(self, batch):
+        """
+        Stage-I baseline forward without latent reasoning rollout.
+        Used for pre-finetuning validation baseline against plain Mol-LLaMA path.
+        """
+        graph_batch = batch["graph_batch"]
+        class _TextBatch:
+            pass
+        text_batch = _TextBatch()
+        text_batch.input_ids = batch["input_ids"]
+        text_batch.attention_mask = batch["attention_mask"]
+        text_batch.labels = batch["labels"]
+        text_batch.mol_token_flag = batch["mol_token_flag"]
+
+        inputs_embeds = self._build_prefill_inputs_embeds(graph_batch, text_batch)
+        llm_out = self.llm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=text_batch.attention_mask,
+            labels=text_batch.labels,
+            output_hidden_states=True,
+            return_dict=True,
+            use_cache=False,
+        )
+
+        bsz = text_batch.input_ids.size(0)
+        ksz = batch["latent_slot_input_ids"].shape[1]
+        zero_latent = torch.zeros(
+            (bsz, ksz, self.llm.config.hidden_size),
+            device=inputs_embeds.device,
+            dtype=inputs_embeds.dtype,
+        )
+        wm_preds = self.stage1_wm_head(torch.zeros((bsz, self.llm.config.hidden_size), device=inputs_embeds.device, dtype=inputs_embeds.dtype))
+        return {
+            "logits": llm_out.logits,
+            "lm_loss": llm_out.loss,
+            "global_latent_state": torch.zeros((bsz, self.llm.config.hidden_size), device=inputs_embeds.device, dtype=inputs_embeds.dtype),
+            "latent_states_all": torch.zeros((bsz, ksz + 1, self.llm.config.hidden_size), device=inputs_embeds.device, dtype=inputs_embeds.dtype),
+            "latent_states": zero_latent,
+            "slot_targets": zero_latent,
+            "wm_preds": wm_preds,
+        }
+
     @torch.no_grad()
     def generate(
         self,
