@@ -60,6 +60,8 @@ class Stage1Trainer(pl.LightningModule):
                 "/home/haoqian/Data/Molecule/Latent/test.csv",
             )
         )
+        self.val_pos_token_id = None
+        self.val_neg_token_id = None
     
     def maybe_autocast(self, dtype=torch.float16):
         # if on cpu, don't use autocast
@@ -188,40 +190,57 @@ class Stage1Trainer(pl.LightningModule):
         batch_size = batch["input_ids"].size(0)
         source_name = batch["source_dataset"][0] if len(batch["source_dataset"]) > 0 else "unknown"
 
-        # Downstream test accuracy (binary): compare first supervised token prediction
-        # against the first gold token at assistant target span.
+        # Downstream test accuracy (binary): use the first supervised token position,
+        # and compare P(Yes-token) vs P(No-token).
         acc = torch.tensor(0.0, device=self.device)
         if "task_label_mask" in batch and batch["task_label_mask"].any():
             logits = outputs["logits"]  # [B, T, V]
-            pred_ids = logits.argmax(dim=-1)  # [B, T]
             labels = batch["labels"].to(logits.device)  # [B, T]
             task_label = batch["task_label"].to(logits.device)
             task_label_mask = batch["task_label_mask"].to(logits.device)
 
-            # Build shifted arrays aligned with causal LM prediction.
-            pred_shift = pred_ids[:, :-1]
+            # Shift for causal LM alignment.
+            logit_shift = logits[:, :-1, :]  # predict labels[:, 1:]
             label_shift = labels[:, 1:]
             valid_shift = label_shift != -100
 
-            # Convert first supervised token prediction to 0/1 by matching each sample's
-            # own gold first token id: equal -> correct class token, not equal -> other class.
-            correct = torch.zeros((batch_size,), dtype=torch.bool, device=logits.device)
-            used = torch.zeros((batch_size,), dtype=torch.bool, device=logits.device)
+            first_pos = torch.full((batch_size,), -1, dtype=torch.long, device=logits.device)
             for bi in range(batch_size):
-                if not bool(task_label_mask[bi]):
-                    continue
                 pos = torch.nonzero(valid_shift[bi], as_tuple=False).flatten()
                 if pos.numel() == 0:
                     continue
-                first_pos = int(pos[0].item())
-                pred_tok = pred_shift[bi, first_pos]
-                gold_tok = label_shift[bi, first_pos]
-                pred_label = 1 if int(pred_tok.item()) == int(gold_tok.item()) else 0
-                correct[bi] = int(pred_label) == int(task_label[bi].item())
-                used[bi] = True
+                first_pos[bi] = int(pos[0].item())
 
-            if used.any():
-                acc = correct[used].float().mean()
+            # Infer yes/no token ids from labeled samples (cached across val steps).
+            for bi in range(batch_size):
+                if not bool(task_label_mask[bi]) or int(first_pos[bi].item()) < 0:
+                    continue
+                gold_tok = int(label_shift[bi, first_pos[bi]].item())
+                y = int(task_label[bi].item())
+                if y == 1 and self.val_pos_token_id is None:
+                    self.val_pos_token_id = gold_tok
+                if y == 0 and self.val_neg_token_id is None:
+                    self.val_neg_token_id = gold_tok
+
+            if self.val_pos_token_id is not None and self.val_neg_token_id is not None:
+                used_idx = []
+                used_pos = []
+                used_label = []
+                for bi in range(batch_size):
+                    if not bool(task_label_mask[bi]) or int(first_pos[bi].item()) < 0:
+                        continue
+                    used_idx.append(bi)
+                    used_pos.append(int(first_pos[bi].item()))
+                    used_label.append(int(task_label[bi].item()))
+                if len(used_idx) > 0:
+                    idx_t = torch.tensor(used_idx, device=logits.device, dtype=torch.long)
+                    pos_t = torch.tensor(used_pos, device=logits.device, dtype=torch.long)
+                    y_t = torch.tensor(used_label, device=logits.device, dtype=torch.long)
+                    step_logits = logit_shift[idx_t, pos_t, :]  # [N, V]
+                    logit_pos = step_logits[:, int(self.val_pos_token_id)]
+                    logit_neg = step_logits[:, int(self.val_neg_token_id)]
+                    pred_label = (logit_pos > logit_neg).long()
+                    acc = (pred_label == y_t).float().mean()
 
         self.log("val/loss", lm_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
         self.log("val/score", score, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
@@ -230,6 +249,10 @@ class Stage1Trainer(pl.LightningModule):
         self.log(f"val/score_{source_name}", score, on_step=False, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
         self.log(f"val/acc_{source_name}", acc, on_step=False, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
         return {"val_loss": lm_loss.detach(), "val_score": score.detach(), "val_acc": acc.detach()}
+
+    def on_validation_epoch_start(self):
+        self.val_pos_token_id = None
+        self.val_neg_token_id = None
 
     def on_validation_epoch_end(self):
         if self.trainer.sanity_checking:

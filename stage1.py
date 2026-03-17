@@ -102,6 +102,8 @@ def main():
         classification_targets=list(_cfg_get(stage1_cfg, "classification_targets", getattr(train_config, "wm_classification_targets", []))),
         eval_downstream_csv_paths=list(_cfg_get(data_cfg, "eval_downstream_csv_paths", [])),
         eval_sample_per_dataset=int(_cfg_get(data_cfg, "eval_sample_per_dataset", 200)),
+        eval_stratified_sampling=bool(_cfg_get(data_cfg, "eval_stratified_sampling", True)),
+        eval_sample_per_class=int(_cfg_get(data_cfg, "eval_sample_per_class", 100)),
         eval_seed=int(_cfg_get(data_cfg, "eval_seed", 42)),
         train_subset_fraction=float(_cfg_get(data_cfg, "train_subset_fraction", 1.0)),
         train_subset_fraction_by_source=_to_plain(_cfg_get(data_cfg, "train_subset_fraction_by_source", {})),

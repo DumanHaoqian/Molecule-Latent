@@ -37,6 +37,8 @@ data:
     - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/HIV/split/test.csv"
     - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/Clintox/split/test.csv"
   eval_sample_per_dataset: 200
+  eval_stratified_sampling: true
+  eval_sample_per_class: 100
   eval_seed: 42
 
   # Training subset control (for quick ablations/debug).

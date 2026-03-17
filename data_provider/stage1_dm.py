@@ -86,6 +86,8 @@ class Stage1DM(LightningDataModule):
         classification_targets=None,
         eval_downstream_csv_paths=None,
         eval_sample_per_dataset: int = 200,
+        eval_stratified_sampling: bool = True,
+        eval_sample_per_class: int = 100,
         eval_seed: int = 42,
         train_subset_fraction: float = 1.0,
         train_subset_fraction_by_source=None,
@@ -111,6 +113,8 @@ class Stage1DM(LightningDataModule):
             eval_downstream_csv_paths = [eval_downstream_csv_paths]
         self.eval_downstream_csv_paths = list(eval_downstream_csv_paths or [])
         self.eval_sample_per_dataset = int(eval_sample_per_dataset)
+        self.eval_stratified_sampling = bool(eval_stratified_sampling)
+        self.eval_sample_per_class = int(eval_sample_per_class)
         self.eval_seed = int(eval_seed)
         self.train_subset_fraction = float(train_subset_fraction)
         self.train_subset_fraction_by_source = dict(train_subset_fraction_by_source or {})
@@ -264,6 +268,8 @@ class Stage1DM(LightningDataModule):
             eval_samples = build_downstream_eval_samples_from_csv(
                 self.eval_downstream_csv_paths,
                 sample_per_dataset=self.eval_sample_per_dataset,
+                stratified_sampling=self.eval_stratified_sampling,
+                sample_per_class=self.eval_sample_per_class,
                 seed=self.eval_seed,
             )
             self.val_dataset = UnifiedStage1Dataset(

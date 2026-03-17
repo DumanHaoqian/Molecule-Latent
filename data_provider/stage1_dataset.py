@@ -449,7 +449,13 @@ def _extract_downstream_label(row, dataset_name):
     return None
 
 
-def build_downstream_eval_samples_from_csv(csv_paths, sample_per_dataset=200, seed=42):
+def build_downstream_eval_samples_from_csv(
+    csv_paths,
+    sample_per_dataset=200,
+    seed=42,
+    stratified_sampling=True,
+    sample_per_class=None,
+):
     """
     Build fixed downstream eval samples from csv test splits.
     Returns unified-schema-like downstream samples used by Stage-I val loop.
@@ -478,7 +484,37 @@ def build_downstream_eval_samples_from_csv(csv_paths, sample_per_dataset=200, se
             raise RuntimeError(f"No valid (smiles,label) rows found in {path}")
 
         n_pick = min(int(sample_per_dataset), len(rows))
-        picked = rng.sample(rows, n_pick) if len(rows) > n_pick else rows
+        if stratified_sampling:
+            pos_rows = [x for x in rows if x[2] == 1]
+            neg_rows = [x for x in rows if x[2] == 0]
+            target_each = int(sample_per_class) if sample_per_class is not None else max(1, n_pick // 2)
+            pick_pos = min(target_each, len(pos_rows))
+            pick_neg = min(target_each, len(neg_rows))
+            picked = []
+            if pick_pos > 0:
+                picked.extend(rng.sample(pos_rows, pick_pos) if len(pos_rows) > pick_pos else pos_rows)
+            if pick_neg > 0:
+                picked.extend(rng.sample(neg_rows, pick_neg) if len(neg_rows) > pick_neg else neg_rows)
+
+            # If one class is insufficient, fill remainder from the unused pool.
+            remain = n_pick - len(picked)
+            if remain > 0:
+                picked_set = set((i, s, y) for i, s, y in picked)
+                remain_pool = [x for x in rows if (x[0], x[1], x[2]) not in picked_set]
+                if len(remain_pool) > 0:
+                    extra_n = min(remain, len(remain_pool))
+                    picked.extend(rng.sample(remain_pool, extra_n) if len(remain_pool) > extra_n else remain_pool)
+            pos_n = sum(1 for _, _, y in picked if y == 1)
+            neg_n = len(picked) - pos_n
+            print(
+                f"[Stage1Eval] {dataset_name}: stratified target(pos={target_each},neg={target_each}), "
+                f"actual(pos={pos_n},neg={neg_n}), total={len(picked)}"
+            )
+        else:
+            picked = rng.sample(rows, n_pick) if len(rows) > n_pick else rows
+            pos_n = sum(1 for _, _, y in picked if y == 1)
+            neg_n = len(picked) - pos_n
+            print(f"[Stage1Eval] {dataset_name}: random sample actual(pos={pos_n},neg={neg_n}), total={len(picked)}")
         for i, smiles, label in picked:
             all_samples.append(
                 {
@@ -517,5 +553,5 @@ def build_downstream_eval_samples_from_csv(csv_paths, sample_per_dataset=200, se
                     },
                 }
             )
-        print(f"[Stage1Eval] {dataset_name}: picked {n_pick}/{len(rows)} samples from {path}")
+        print(f"[Stage1Eval] {dataset_name}: picked {len(picked)}/{len(rows)} samples from {path}")
     return all_samples
