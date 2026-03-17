@@ -37,6 +37,8 @@ class Stage1UnifiedCollater:
         max_latent_slots=6,
         latent_slot_text_max_len=48,
         text_max_len=512,
+        regression_targets=None,
+        classification_targets=None,
     ):
         self.tokenizer = tokenizer
         self.llama_version = llama_version
@@ -44,6 +46,10 @@ class Stage1UnifiedCollater:
         self.max_latent_slots = max_latent_slots
         self.latent_slot_text_max_len = latent_slot_text_max_len
         self.text_max_len = text_max_len
+        self.reg_keys = list(regression_targets or [
+            "molecular_weight", "logp", "tpsa", "hbd", "hba", "num_rings", "aromatic_ring_count", "qed"
+        ])
+        self.cls_keys = list(classification_targets or ["ro5_pass", "ro5_violation_count"])
         if "unimol" in encoder_types:
             self.d3_collater = Mol3DCollater(pad_idx)
 
@@ -114,22 +120,23 @@ class Stage1UnifiedCollater:
         latent_slot_input_ids = slot_tokens.input_ids.view(batch_size, self.max_latent_slots, -1)
         latent_slot_attention_mask = slot_tokens.attention_mask.view(batch_size, self.max_latent_slots, -1)
 
-        reg_keys = ["molecular_weight", "logp", "tpsa", "hbd", "hba", "num_rings", "aromatic_ring_count", "qed"]
-        cls_keys = ["ro5_pass", "ro5_violation_count"]
-        property_regression_targets = torch.zeros((batch_size, len(reg_keys)), dtype=torch.float32)
-        property_regression_mask = torch.zeros((batch_size, len(reg_keys)), dtype=torch.bool)
-        property_classification_targets = torch.zeros((batch_size, len(cls_keys)), dtype=torch.float32)
-        property_classification_mask = torch.zeros((batch_size, len(cls_keys)), dtype=torch.bool)
+        property_regression_targets = torch.zeros((batch_size, len(self.reg_keys)), dtype=torch.float32)
+        property_regression_mask = torch.zeros((batch_size, len(self.reg_keys)), dtype=torch.bool)
+        property_classification_targets = torch.zeros((batch_size, len(self.cls_keys)), dtype=torch.float32)
+        property_classification_mask = torch.zeros((batch_size, len(self.cls_keys)), dtype=torch.bool)
         for bi, info in enumerate(other_infos):
             reg = info.get("property_regression", {}) or {}
             cls = info.get("property_classification", {}) or {}
-            for ki, key in enumerate(reg_keys):
+            for ki, key in enumerate(self.reg_keys):
                 if key in reg and reg[key] is not None:
                     property_regression_targets[bi, ki] = float(reg[key])
                     property_regression_mask[bi, ki] = True
-            for ki, key in enumerate(cls_keys):
+            for ki, key in enumerate(self.cls_keys):
                 if key in cls and cls[key] is not None:
-                    property_classification_targets[bi, ki] = float(cls[key])
+                    val = cls[key]
+                    if isinstance(val, bool):
+                        val = 1.0 if val else 0.0
+                    property_classification_targets[bi, ki] = float(val)
                     property_classification_mask[bi, ki] = True
 
         text_targets = [messages[-1]["content"] if len(messages) > 0 else "" for messages in messages_list]
@@ -154,6 +161,8 @@ class Stage1UnifiedCollater:
             "property_regression_mask": property_regression_mask,
             "property_classification_targets": property_classification_targets,
             "property_classification_mask": property_classification_mask,
+            "property_regression_keys": self.reg_keys,
+            "property_classification_keys": self.cls_keys,
             "text_targets": text_targets,
             "meta_info": [info.get("meta", {}) for info in other_infos],
             "has_latent_target": has_latent_target,

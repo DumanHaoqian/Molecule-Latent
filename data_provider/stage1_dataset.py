@@ -1,4 +1,5 @@
 import json
+import os
 from collections import defaultdict
 
 import numpy as np
@@ -58,7 +59,7 @@ def _gen_3d_conformation(smiles):
 class UnifiedStage1Dataset(Dataset):
     def __init__(
         self,
-        jsonl_path,
+        data_paths,
         source_name,
         task_type,
         unimol_dictionary,
@@ -78,7 +79,28 @@ class UnifiedStage1Dataset(Dataset):
         self.mol_prompt = "<mol><mol><mol><mol><mol><mol><mol><mol>"
         self.default_system = "You are a helpful assistant specializing in chemistry and biology."
         self.samples = []
-        with open(jsonl_path, "r", encoding="utf-8") as f:
+        if isinstance(data_paths, str):
+            data_paths = [data_paths]
+        self.data_paths = [p for p in (data_paths or []) if isinstance(p, str) and len(p) > 0]
+        self._load_all_samples()
+        if len(self.samples) == 0:
+            raise RuntimeError(
+                f"UnifiedStage1Dataset(source={self.source_name}, task={self.task_type}) loaded 0 samples from {self.data_paths}"
+            )
+
+    def __len__(self):
+        return len(self.samples)
+
+    def _load_all_samples(self):
+        for path in self.data_paths:
+            ext = os.path.splitext(path)[1].lower()
+            if ext == ".json":
+                self._load_json_file(path)
+            else:
+                self._load_jsonl_file(path)
+
+    def _load_jsonl_file(self, path):
+        with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -87,11 +109,214 @@ class UnifiedStage1Dataset(Dataset):
                     obj = json.loads(line)
                 except Exception:
                     continue
-                if isinstance(obj, dict):
-                    self.samples.append(obj)
+                sample = self._normalize_sample(obj)
+                if sample is not None:
+                    self.samples.append(sample)
 
-    def __len__(self):
-        return len(self.samples)
+    def _load_json_file(self, path):
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            iterable = data
+        elif isinstance(data, dict):
+            iterable = data.get("data", [])
+        else:
+            iterable = []
+        for obj in iterable:
+            sample = self._normalize_sample(obj)
+            if sample is not None:
+                self.samples.append(sample)
+
+    def _normalize_sample(self, obj):
+        if not isinstance(obj, dict):
+            return None
+        if "task_type" in obj and "targets" in obj and "molecule" in obj:
+            return obj
+        if self.task_type == "latent_world_modeling":
+            return self._normalize_latent_raw(obj)
+        if self.task_type == "conversation":
+            return self._normalize_conversation_raw(obj)
+        if self.task_type == "downstream":
+            return self._normalize_downstream_raw(obj)
+        return None
+
+    def _normalize_latent_raw(self, obj):
+        features = obj.get("molecule_features") or {}
+        candidate_subgraphs = obj.get("candidate_subgraphs") or []
+        latent_slots = []
+        for idx, slot in enumerate(candidate_subgraphs):
+            if not isinstance(slot, dict):
+                continue
+            latent_slots.append(
+                {
+                    "slot_name": f"slot_{idx + 1}",
+                    "target_type": "subgraph",
+                    "value": {
+                        "name": slot.get("name"),
+                        "type": slot.get("type"),
+                        "smiles": slot.get("smiles"),
+                        "atom_ids": slot.get("atom_ids"),
+                        "motif_subtype": slot.get("motif_subtype"),
+                    },
+                }
+            )
+            if len(latent_slots) >= self.max_latent_slots:
+                break
+        return {
+            "sample_id": obj.get("id"),
+            "source_dataset": "PubChemLatent",
+            "split": obj.get("split", "train"),
+            "task_type": "latent_world_modeling",
+            "stage_tags": ["stage1"],
+            "molecule": {
+                "smiles": obj.get("smiles"),
+                "canonical_smiles": obj.get("smiles"),
+                "iupac_name": obj.get("iupac_name"),
+            },
+            "input": {
+                "system_prompt": self.default_system,
+                "instruction": "Describe the molecular structure, key subgraphs, and physicochemical properties of the given molecule.",
+                "conversation_history": [],
+            },
+            "targets": {
+                "text": obj.get("enriched_description", ""),
+                "latent": {"slots": latent_slots},
+                "properties": {
+                    "regression": {
+                        "molecular_weight": features.get("molecular_weight"),
+                        "logp": features.get("logp"),
+                        "tpsa": features.get("tpsa"),
+                        "hbd": features.get("hbd"),
+                        "hba": features.get("hba"),
+                        "num_rings": features.get("num_rings"),
+                        "aromatic_ring_count": features.get("aromatic_ring_count"),
+                        "qed": features.get("qed"),
+                    },
+                    "classification": {
+                        "ro5_pass": features.get("ro5_pass"),
+                        "ro5_violation_count": features.get("ro5_violation_count"),
+                    },
+                },
+                "task": {"task_name": None, "task_kind": None, "label": None, "label_text": None},
+            },
+            "quality": {
+                "quality_score": ((obj.get("qa_report") or {}).get("total_score")),
+                "quality_label": ((obj.get("qa_report") or {}).get("quality_label")),
+            },
+            "meta": {
+                "has_latent_target": len(latent_slots) > 0,
+                "has_text_target": bool(obj.get("enriched_description")),
+                "has_property_target": True,
+                "has_task_label": False,
+            },
+        }
+
+    def _normalize_conversation_raw(self, obj):
+        convs = obj.get("conversations") or []
+        history = []
+        instruction = obj.get("instruction", "")
+        target_text = obj.get("output", "")
+        if isinstance(convs, list) and len(convs) > 0:
+            turns = [t for t in convs if isinstance(t, dict) and isinstance(t.get("user"), str) and isinstance(t.get("assistant"), str)]
+            if len(turns) > 0:
+                instruction = turns[-1]["user"]
+                target_text = turns[-1]["assistant"]
+                for t in turns[:-1]:
+                    history.append({"role": "user", "content": t["user"]})
+                    history.append({"role": "assistant", "content": t["assistant"]})
+        return {
+            "sample_id": obj.get("id") or obj.get("cid"),
+            "source_dataset": "ComprehensiveConversation",
+            "split": obj.get("split", "train"),
+            "task_type": "conversation",
+            "stage_tags": ["stage1", "stage2"],
+            "molecule": {
+                "smiles": obj.get("smiles"),
+                "canonical_smiles": obj.get("smiles"),
+                "iupac_name": obj.get("iupac_name"),
+            },
+            "input": {
+                "system_prompt": obj.get("system") or self.default_system,
+                "instruction": instruction,
+                "conversation_history": history,
+            },
+            "targets": {
+                "text": target_text,
+                "latent": {"slots": []},
+                "properties": {"regression": {}, "classification": {}},
+                "task": {"task_name": None, "task_kind": None, "label": None, "label_text": None},
+            },
+            "quality": {"quality_score": None, "quality_label": "unknown"},
+            "meta": {
+                "has_latent_target": False,
+                "has_text_target": bool(target_text),
+                "has_property_target": False,
+                "has_task_label": False,
+            },
+        }
+
+    def _normalize_downstream_raw(self, obj):
+        features = obj.get("molecule_features") or {}
+        label = obj.get("label")
+        label_text = None
+        try:
+            if label is not None:
+                label_i = int(label)
+                if label_i in (0, 1):
+                    label_text = "Yes" if label_i == 1 else "No"
+                    label = label_i
+        except (TypeError, ValueError):
+            pass
+        return {
+            "sample_id": obj.get("id"),
+            "source_dataset": obj.get("dataset", "DownstreamTasks"),
+            "split": obj.get("split", "train"),
+            "task_type": "downstream",
+            "stage_tags": ["stage1", "stage3"],
+            "molecule": {
+                "smiles": obj.get("smiles"),
+                "canonical_smiles": obj.get("smiles"),
+                "iupac_name": obj.get("iupac_name"),
+            },
+            "input": {
+                "system_prompt": self.default_system,
+                "instruction": "Analyze the molecule and answer the downstream task.",
+                "conversation_history": [],
+            },
+            "targets": {
+                "text": obj.get("enriched_description") or label_text or "",
+                "latent": {"slots": []},
+                "properties": {
+                    "regression": {
+                        "molecular_weight": features.get("molecular_weight"),
+                        "logp": features.get("logp"),
+                        "tpsa": features.get("tpsa"),
+                        "hbd": features.get("hbd"),
+                        "hba": features.get("hba"),
+                        "num_rings": features.get("num_rings"),
+                        "aromatic_ring_count": features.get("aromatic_ring_count"),
+                        "qed": features.get("qed"),
+                    },
+                    "classification": {
+                        "ro5_pass": features.get("ro5_pass"),
+                        "ro5_violation_count": features.get("ro5_violation_count"),
+                    },
+                },
+                "task": {
+                    "task_name": obj.get("dataset"),
+                    "task_kind": "binary_classification",
+                    "label": label,
+                    "label_text": label_text,
+                },
+            },
+            "quality": {"quality_score": ((obj.get("qa_report") or {}).get("total_score")), "quality_label": ((obj.get("qa_report") or {}).get("quality_label"))},
+            "meta": {
+                "has_latent_target": False,
+                "has_text_target": bool(obj.get("enriched_description")) or label_text is not None,
+                "has_property_target": True,
+                "has_task_label": label in (0, 1),
+            },
+        }
 
     def _build_graphs(self, smiles):
         data_graph = defaultdict(list)

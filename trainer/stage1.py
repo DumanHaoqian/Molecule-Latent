@@ -24,6 +24,7 @@ class Stage1Trainer(pl.LightningModule):
     def __init__(self, vocab_size, model_config, train_config):
         super().__init__()
         self.train_config = train_config
+        stage1_cfg = getattr(train_config, "stage1", {})
         if train_config.precision == 'bf16-mixed':
             torch_dtype = "bfloat16"
         elif train_config.precision == '16':
@@ -37,6 +38,9 @@ class Stage1Trainer(pl.LightningModule):
             torch_dtype=torch_dtype,
             enable_flash=getattr(train_config, "enable_flash", False),
             use_latent_reasoning=False,
+            stage1_max_latent_slots=int(getattr(stage1_cfg, "max_latent_slots", getattr(train_config, "max_latent_slots", 6))),
+            stage1_wm_reg_keys=list(getattr(stage1_cfg, "regression_targets", getattr(train_config, "wm_regression_targets", []))),
+            stage1_wm_cls_keys=list(getattr(stage1_cfg, "classification_targets", getattr(train_config, "wm_classification_targets", []))),
         )
         self.lambda_latent = float(getattr(train_config, "loss_weights", {}).get("latent", 1.0))
         self.lambda_wm = float(getattr(train_config, "loss_weights", {}).get("wm", 1.0))
@@ -45,6 +49,7 @@ class Stage1Trainer(pl.LightningModule):
         self.lambda_down_lm = float(getattr(train_config, "loss_weights", {}).get("downstream_lm", 1.0))
         self.source_counter = defaultdict(int)
         self.task_to_id = {"latent_world_modeling": 0, "conversation": 1, "downstream": 2}
+        self.source_to_id = {"PubChemLatent": 0, "ComprehensiveConversation": 1, "DownstreamTasks": 2}
     
     def maybe_autocast(self, dtype=torch.float16):
         # if on cpu, don't use autocast
@@ -67,6 +72,12 @@ class Stage1Trainer(pl.LightningModule):
         else:
             raise NotImplementedError()
         return optimizer
+
+    def load_from_hf_dir(self, hf_dir):
+        self.mol_llama.load_from_hf_dir(hf_dir)
+
+    def load_from_ckpt(self, ckpt_path):
+        self.mol_llama.load_from_ckpt(ckpt_path)
 
     def _compute_latent_loss(self, latent_states, slot_targets, slot_mask):
         # cosine alignment on valid latent slots
@@ -142,6 +153,9 @@ class Stage1Trainer(pl.LightningModule):
         self.log(f"train/{task_type}/loss_latent", latent_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
         self.log(f"train/{task_type}/loss_wm", wm_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
         self.log("train/task_type_id", float(self.task_to_id.get(task_type, -1)), on_step=True, on_epoch=False, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log("train/source_name_id", float(self.source_to_id.get(source_name, -1)), on_step=True, on_epoch=False, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log(f"train/task_type/{task_type}", 1.0, on_step=True, on_epoch=False, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log(f"train/source_name/{source_name}", 1.0, on_step=True, on_epoch=False, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
         self.log("train/valid_latent_slots_mean", valid_slot_mean, on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
         self.log("train/valid_property_targets_mean", valid_prop_mean, on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
         self.log("train/lr", self.trainer.optimizers[0].param_groups[0]['lr'], on_step=True, on_epoch=False, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)

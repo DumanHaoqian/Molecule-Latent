@@ -40,6 +40,23 @@ class MolLLaMAPreTrainedModel(PreTrainedModel):
         r"llm."
     ]
 
+
+class Stage1WorldModelHead(nn.Module):
+    def __init__(self, hidden_size, regression_keys, classification_keys):
+        super().__init__()
+        self.regression_keys = list(regression_keys)
+        self.classification_keys = list(classification_keys)
+        self.reg_head = nn.Linear(hidden_size, len(self.regression_keys))
+        self.cls_head = nn.Linear(hidden_size, len(self.classification_keys))
+
+    def forward(self, pooled_latent):
+        return {
+            "regression": self.reg_head(pooled_latent),
+            "classification_logits": self.cls_head(pooled_latent),
+            "regression_keys": self.regression_keys,
+            "classification_keys": self.classification_keys,
+        }
+
 class MolLLaMA(MolLLaMAPreTrainedModel):
     def __init__(
         self,
@@ -52,6 +69,9 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
         lambda_latent=1.0,
         lambda_lm=1.0,
         lambda_cls=0.5,
+        stage1_max_latent_slots=6,
+        stage1_wm_reg_keys=None,
+        stage1_wm_cls_keys=None,
     ):
         super().__init__(config)
 
@@ -104,15 +124,19 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
         self.latent_cls_head = nn.Linear(self.llm.config.hidden_size, 2)
 
         # Stage-I unified training heads (lightweight and optional).
-        self.stage1_max_latent_slots = 6
+        self.stage1_max_latent_slots = int(stage1_max_latent_slots)
         self.stage1_slot_queries = nn.Parameter(
             torch.randn(1, self.stage1_max_latent_slots, self.llm.config.hidden_size) * 0.02
         )
+        self.stage1_hidden_to_latent = nn.Linear(self.llm.config.hidden_size, self.llm.config.hidden_size)
         self.stage1_slot_target_proj = nn.Linear(self.llm.config.hidden_size, self.llm.config.hidden_size)
-        self.stage1_wm_reg_keys = ["molecular_weight", "logp", "tpsa", "hbd", "hba", "num_rings", "aromatic_ring_count", "qed"]
-        self.stage1_wm_cls_keys = ["ro5_pass", "ro5_violation_count"]
-        self.stage1_wm_reg_head = nn.Linear(self.llm.config.hidden_size, len(self.stage1_wm_reg_keys))
-        self.stage1_wm_cls_head = nn.Linear(self.llm.config.hidden_size, len(self.stage1_wm_cls_keys))
+        self.stage1_wm_reg_keys = list(stage1_wm_reg_keys or ["molecular_weight", "logp", "tpsa", "hbd", "hba", "num_rings", "aromatic_ring_count", "qed"])
+        self.stage1_wm_cls_keys = list(stage1_wm_cls_keys or ["ro5_pass", "ro5_violation_count"])
+        self.stage1_wm_head = Stage1WorldModelHead(
+            hidden_size=self.llm.config.hidden_size,
+            regression_keys=self.stage1_wm_reg_keys,
+            classification_keys=self.stage1_wm_cls_keys,
+        )
 
     def postprocess_encoder(self):
         self.encoder.Qformer.cls = None
@@ -345,23 +369,15 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
             use_cache=False,
         )
 
-        # Latent states from molecular query tokens (lightweight first runnable version).
-        _, _, query_output = self.encoder.graph_forward(graph_batch)
-        query_states = self.llm_proj(query_output.last_hidden_state)  # [B, Q, H]
-        qlen = query_states.shape[1]
-        max_slots = min(self.stage1_max_latent_slots, qlen)
-        latent_states = query_states[:, :max_slots, :]
-        if max_slots < self.stage1_max_latent_slots:
-            pad = torch.zeros(
-                (query_states.shape[0], self.stage1_max_latent_slots - max_slots, query_states.shape[-1]),
-                device=query_states.device,
-                dtype=query_states.dtype,
-            )
-            latent_states = torch.cat([latent_states, pad], dim=1)
+        # Stage-I latent states: derive a fixed number of slots from LLM hidden states.
+        hidden = llm_out.hidden_states[-1]  # [B, T, H]
+        hidden_mask = text_batch.attention_mask.unsqueeze(-1).to(hidden.dtype)
+        hidden_mean = (hidden * hidden_mask).sum(dim=1, keepdim=True) / hidden_mask.sum(dim=1, keepdim=True).clamp(min=1.0)
+        latent_states = self.stage1_slot_queries.expand(hidden.shape[0], -1, -1) + hidden_mean
+        latent_states = self.stage1_hidden_to_latent(latent_states)
 
         pooled_latent = latent_states.mean(dim=1)
-        wm_reg_preds = self.stage1_wm_reg_head(pooled_latent)
-        wm_cls_logits = self.stage1_wm_cls_head(pooled_latent)
+        wm_preds = self.stage1_wm_head(pooled_latent)
 
         # Slot target embedding from slot descriptor tokens (tokenized by collater).
         model_device = next(self.parameters()).device
@@ -379,12 +395,7 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
             "lm_loss": llm_out.loss,
             "latent_states": latent_states,
             "slot_targets": slot_targets,
-            "wm_preds": {
-                "regression": wm_reg_preds,
-                "classification_logits": wm_cls_logits,
-                "regression_keys": self.stage1_wm_reg_keys,
-                "classification_keys": self.stage1_wm_cls_keys,
-            },
+            "wm_preds": wm_preds,
         }
 
     @torch.no_grad()
@@ -566,6 +577,7 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
             "latent_norm.",
             "subregion_proj.",
             "latent_cls_head.",
+            "stage1_",
         )
         filtered_missing = [
             k for k in missing_keys

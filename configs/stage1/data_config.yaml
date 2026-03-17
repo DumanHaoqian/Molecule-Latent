@@ -7,3 +7,27 @@ latent_world_modeling_path: /home/haoqian/Data/Molecule/Construction/Datasets/un
 conversation_sft_path: /home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/conversation_sft.jsonl
 downstream_tasks_path: /home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/downstream_tasks.jsonl
 
+data:
+  num_workers: 8
+  batch_size: 2
+  text_max_len: 512
+
+  latent_path: "/home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/latent_world_modeling.jsonl"
+  conversation_path: "/home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/conversation_sft.jsonl"
+  downstream_paths:
+    - "/home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/downstream_tasks.jsonl"
+
+  fallback_raw_paths:
+    latent_path: "/home/haoqian/Data/Molecule/Construction/Datasets/SFT/pubchem_17k.jsonl"
+    conversation_path: "/home/haoqian/Data/Molecule/Construction/Datasets/SFT/conversations_2k.json"
+    downstream_paths:
+      - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed_with_subgraphs/BACE/train.jsonl"
+      - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed_with_subgraphs/BBBP/train.jsonl"
+      - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed_with_subgraphs/Clintox/train.jsonl"
+      - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed_with_subgraphs/HIV/train.jsonl"
+
+  source_sampling_weights:
+    pubchem: 0.8
+    conversation: 0.1
+    downstream: 0.1
+

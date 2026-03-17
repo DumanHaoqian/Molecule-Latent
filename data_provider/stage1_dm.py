@@ -1,8 +1,9 @@
-from typing import Dict, List
+from typing import Dict
 
+import os
 import torch
 from pytorch_lightning import LightningDataModule
-from torch.utils.data import BatchSampler, ConcatDataset, DataLoader, Sampler
+from torch.utils.data import BatchSampler, ConcatDataset, DataLoader
 
 from data_provider.collaters import Stage1UnifiedCollater
 from data_provider.stage1_dataset import UnifiedStage1Dataset
@@ -77,8 +78,12 @@ class Stage1DM(LightningDataModule):
         stage1_mixed_training: bool = True,
         latent_world_modeling_path: str = "",
         conversation_sft_path: str = "",
-        downstream_tasks_path: str = "",
+        downstream_tasks_paths=None,
+        fallback_raw_paths=None,
         source_sampling_weights=None,
+        use_task_tokens: bool = True,
+        regression_targets=None,
+        classification_targets=None,
         seed: int = 42,
     ):
         super().__init__()
@@ -93,10 +98,16 @@ class Stage1DM(LightningDataModule):
         self.latent_slot_text_max_len = latent_slot_text_max_len
         self.stage1_mixed_training = stage1_mixed_training
         self.seed = seed
+        self.use_task_tokens = use_task_tokens
+        self.regression_targets = list(regression_targets or [])
+        self.classification_targets = list(classification_targets or [])
 
         self.latent_world_modeling_path = latent_world_modeling_path
         self.conversation_sft_path = conversation_sft_path
-        self.downstream_tasks_path = downstream_tasks_path
+        if isinstance(downstream_tasks_paths, str):
+            downstream_tasks_paths = [downstream_tasks_paths]
+        self.downstream_tasks_paths = list(downstream_tasks_paths or [])
+        self.fallback_raw_paths = fallback_raw_paths or {}
         self.source_sampling_weights = source_sampling_weights or {
             "pubchem": 0.8,
             "conversation": 0.1,
@@ -107,37 +118,79 @@ class Stage1DM(LightningDataModule):
         self.train_dataset = None
         self.train_batch_sampler = None
 
+    def _resolve_source_paths(self):
+        resolved = {"pubchem": [], "conversation": [], "downstream": []}
+        # Primary unified paths
+        if self.latent_world_modeling_path:
+            resolved["pubchem"] = [self.latent_world_modeling_path]
+        if self.conversation_sft_path:
+            resolved["conversation"] = [self.conversation_sft_path]
+        if self.downstream_tasks_paths:
+            resolved["downstream"] = [p for p in self.downstream_tasks_paths if p]
+
+        # Fallback raw paths
+        fallback_latent = self.fallback_raw_paths.get("latent_path", "")
+        fallback_conversation = self.fallback_raw_paths.get("conversation_path", "")
+        fallback_downstream = self.fallback_raw_paths.get("downstream_paths", [])
+        if isinstance(fallback_downstream, str):
+            fallback_downstream = [fallback_downstream]
+
+        if (not resolved["pubchem"]) or (not all(os.path.exists(p) for p in resolved["pubchem"])):
+            if fallback_latent:
+                resolved["pubchem"] = [fallback_latent]
+        if (not resolved["conversation"]) or (not all(os.path.exists(p) for p in resolved["conversation"])):
+            if fallback_conversation:
+                resolved["conversation"] = [fallback_conversation]
+        if (not resolved["downstream"]) or (not all(os.path.exists(p) for p in resolved["downstream"])):
+            resolved["downstream"] = [p for p in fallback_downstream if p]
+
+        for source, paths in resolved.items():
+            if len(paths) == 0:
+                raise FileNotFoundError(f"[Stage1DM] no path configured for source '{source}'.")
+            missing = [p for p in paths if not os.path.exists(p)]
+            if missing:
+                raise FileNotFoundError(f"[Stage1DM] missing files for source '{source}': {missing}")
+        return resolved
+
     def setup(self, stage=None):
         if not self.stage1_mixed_training:
             raise ValueError("Legacy stage1 pretrain dataset is disabled. Please enable stage1_mixed_training.")
 
+        resolved_paths = self._resolve_source_paths()
+        print(f"[Stage1DM] active paths (pubchem): {resolved_paths['pubchem']}")
+        print(f"[Stage1DM] active paths (conversation): {resolved_paths['conversation']}")
+        print(f"[Stage1DM] active paths (downstream): {resolved_paths['downstream']}")
+
         datasets = {}
-        if self.latent_world_modeling_path:
+        if resolved_paths["pubchem"]:
             datasets["pubchem"] = UnifiedStage1Dataset(
-                self.latent_world_modeling_path,
+                resolved_paths["pubchem"],
                 source_name="PubChemLatent",
                 task_type="latent_world_modeling",
                 unimol_dictionary=self.unimol_dictionary,
                 encoder_types=self.encoder_types,
                 max_latent_slots=self.max_latent_slots,
+                use_task_tokens=self.use_task_tokens,
             )
-        if self.conversation_sft_path:
+        if resolved_paths["conversation"]:
             datasets["conversation"] = UnifiedStage1Dataset(
-                self.conversation_sft_path,
+                resolved_paths["conversation"],
                 source_name="ComprehensiveConversation",
                 task_type="conversation",
                 unimol_dictionary=self.unimol_dictionary,
                 encoder_types=self.encoder_types,
                 max_latent_slots=self.max_latent_slots,
+                use_task_tokens=self.use_task_tokens,
             )
-        if self.downstream_tasks_path:
+        if resolved_paths["downstream"]:
             datasets["downstream"] = UnifiedStage1Dataset(
-                self.downstream_tasks_path,
+                resolved_paths["downstream"],
                 source_name="DownstreamTasks",
                 task_type="downstream",
                 unimol_dictionary=self.unimol_dictionary,
                 encoder_types=self.encoder_types,
                 max_latent_slots=self.max_latent_slots,
+                use_task_tokens=self.use_task_tokens,
             )
         if len(datasets) == 0:
             raise ValueError("No stage1 unified dataset path provided.")
@@ -174,6 +227,8 @@ class Stage1DM(LightningDataModule):
             max_latent_slots=self.max_latent_slots,
             latent_slot_text_max_len=self.latent_slot_text_max_len,
             text_max_len=self.text_max_len,
+            regression_targets=self.regression_targets,
+            classification_targets=self.classification_targets,
         )
         return DataLoader(
             self.train_dataset,

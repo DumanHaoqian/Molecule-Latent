@@ -1,4 +1,5 @@
 import os
+import argparse
 
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
@@ -11,12 +12,24 @@ from trainer.stage1 import Stage1Trainer
 from utils.configuration_mol_llama import MolLLaMAConfig
 
 
-def _load_configs():
-    train_cfg_path = os.path.join("configs", "stage1", "train_config.yaml")
-    data_cfg_path = os.path.join("configs", "stage1", "data_config.yaml")
+def _load_configs(train_cfg_path=None, data_cfg_path=None):
+    train_cfg_path = train_cfg_path or os.path.join("configs", "stage1", "train_config.yaml")
+    data_cfg_path = data_cfg_path or os.path.join("configs", "stage1", "data_config.yaml")
     train_config = OmegaConf.load(train_cfg_path)
     data_config = OmegaConf.load(data_cfg_path)
     return train_config, data_config
+
+
+def _cfg_get(cfg, key, default=None):
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+
+def _to_plain(obj):
+    return OmegaConf.to_container(obj, resolve=True) if OmegaConf.is_config(obj) else obj
 
 
 def _build_tokenizer(llm_model_name):
@@ -32,32 +45,61 @@ def _build_tokenizer(llm_model_name):
 
 
 def main():
-    train_config, data_config = _load_configs()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train_config", default=os.path.join("configs", "stage1", "train_config.yaml"))
+    parser.add_argument("--data_config", default=os.path.join("configs", "stage1", "data_config.yaml"))
+    args = parser.parse_args()
+
+    train_config, data_config = _load_configs(args.train_config, args.data_config)
     pl.seed_everything(int(getattr(train_config, "seed", 42)), workers=True)
 
+    model_cfg = _cfg_get(train_config, "model", {})
+    stage1_cfg = _cfg_get(train_config, "stage1", {})
+    data_cfg = _cfg_get(data_config, "data", {})
+    loss_weights = _cfg_get(train_config, "loss_weights", {})
+
+    stage0_checkpoint_path = str(_cfg_get(model_cfg, "stage0_checkpoint_path", ""))
+    llm_model_name = str(_cfg_get(model_cfg, "llm_model", "meta-llama/Llama-3.1-8B-Instruct"))
+
     model_config = MolLLaMAConfig()
+    model_config.llm_config.llm_model = llm_model_name
     model_config.graph_encoder_config.encoder_types = ["unimol", "moleculestm"]
     tokenizer = _build_tokenizer(model_config.llm_config.llm_model)
     llama_version = "llama3" if "Llama-3" in model_config.llm_config.llm_model else "llama2"
 
     model = Stage1Trainer(vocab_size=len(tokenizer), model_config=model_config, train_config=train_config)
+    if stage0_checkpoint_path:
+        print(f"[Stage1] stage0 checkpoint path: {stage0_checkpoint_path}")
+        if not os.path.exists(stage0_checkpoint_path):
+            raise FileNotFoundError(f"[Stage1] stage0 checkpoint path not found: {stage0_checkpoint_path}")
+        if os.path.isdir(stage0_checkpoint_path):
+            model.load_from_hf_dir(stage0_checkpoint_path)
+        else:
+            model.load_from_ckpt(stage0_checkpoint_path)
     unimol_dictionary = getattr(model.mol_llama.encoder, "unimol_dictionary", None)
 
+    downstream_paths = _cfg_get(data_cfg, "downstream_paths", [])
+    if isinstance(downstream_paths, str):
+        downstream_paths = [downstream_paths]
     datamodule = Stage1DM(
         tokenizer=tokenizer,
         llama_version=llama_version,
-        num_workers=int(data_config.num_workers),
-        batch_size=int(data_config.batch_size),
+        num_workers=int(_cfg_get(data_cfg, "num_workers", data_config.num_workers)),
+        batch_size=int(_cfg_get(data_cfg, "batch_size", data_config.batch_size)),
         unimol_dictionary=unimol_dictionary,
         encoder_types=model_config.graph_encoder_config.encoder_types,
-        text_max_len=int(data_config.text_max_len),
-        max_latent_slots=int(getattr(train_config, "max_latent_slots", 6)),
+        text_max_len=int(_cfg_get(data_cfg, "text_max_len", data_config.text_max_len)),
+        max_latent_slots=int(_cfg_get(stage1_cfg, "max_latent_slots", getattr(train_config, "max_latent_slots", 6))),
         latent_slot_text_max_len=int(getattr(train_config, "latent_slot_text_max_len", 48)),
-        stage1_mixed_training=bool(getattr(train_config, "stage1_mixed_training", True)),
-        latent_world_modeling_path=str(getattr(data_config, "latent_world_modeling_path", "")),
-        conversation_sft_path=str(getattr(data_config, "conversation_sft_path", "")),
-        downstream_tasks_path=str(getattr(data_config, "downstream_tasks_path", "")),
-        source_sampling_weights=OmegaConf.to_container(getattr(train_config, "source_sampling_weights", {}), resolve=True),
+        stage1_mixed_training=bool(_cfg_get(stage1_cfg, "use_mixed_stage1_training", getattr(train_config, "stage1_mixed_training", True))),
+        latent_world_modeling_path=str(_cfg_get(data_cfg, "latent_path", getattr(data_config, "latent_world_modeling_path", ""))),
+        conversation_sft_path=str(_cfg_get(data_cfg, "conversation_path", getattr(data_config, "conversation_sft_path", ""))),
+        downstream_tasks_paths=downstream_paths or [str(getattr(data_config, "downstream_tasks_path", ""))],
+        fallback_raw_paths=_to_plain(_cfg_get(data_cfg, "fallback_raw_paths", {})),
+        source_sampling_weights=_to_plain(_cfg_get(data_cfg, "source_sampling_weights", getattr(train_config, "source_sampling_weights", {}))),
+        use_task_tokens=bool(_cfg_get(stage1_cfg, "use_task_tokens", getattr(train_config, "use_task_tokens", True))),
+        regression_targets=list(_cfg_get(stage1_cfg, "regression_targets", getattr(train_config, "wm_regression_targets", []))),
+        classification_targets=list(_cfg_get(stage1_cfg, "classification_targets", getattr(train_config, "wm_classification_targets", []))),
         seed=int(getattr(train_config, "seed", 42)),
     )
 
@@ -85,6 +127,8 @@ def main():
             {
                 "train_config": OmegaConf.to_container(train_config, resolve=True),
                 "data_config": OmegaConf.to_container(data_config, resolve=True),
+                "stage0_checkpoint_path": stage0_checkpoint_path,
+                "loss_weights": loss_weights,
             }
         )
         loggers.append(wandb_logger)
