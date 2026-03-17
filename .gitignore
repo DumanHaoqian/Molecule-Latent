@@ -14,3 +14,7 @@ wandb/
 ## Playground Files
 playground_inputs.json
 playground_outputs.json
+
+
+## Pychache
+__pycache__/
