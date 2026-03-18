@@ -623,7 +623,7 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
         pad_token_id=None,
         eos_token_id=None,
     ):
-        if smiles_list is not []:
+        if isinstance(smiles_list, list) and len(smiles_list) > 0:
             graph_batch = get_mol_graphs(smiles_list, self.encoder.unimol_dictionary, self.device)
         else:
             graph_batch = None
