@@ -33,12 +33,11 @@ latent_slot_text_max_len: 48
 
 source_sampling_weights:
   pubchem: 0.8
-  conversation: 0.1
-  downstream: 0.1
+  conversation: 0.2
 
 loss_weights:
   latent: 1.0
-  wm: 0.01
+  wm: 0.0
   lm: 1
   conv_lm: 1.0
   downstream_lm: 1.0

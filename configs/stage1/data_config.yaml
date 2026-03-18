@@ -28,8 +28,12 @@ data:
 
   source_sampling_weights:
     pubchem: 0.8
-    conversation: 0.1
-    downstream: 0.1
+    conversation: 0.2
+
+  # Restrict Stage-I to these training sources only.
+  enabled_sources:
+    - pubchem
+    - conversation
 
   eval_downstream_csv_paths:
     - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/BACE/split/test.csv"
@@ -48,6 +52,8 @@ data:
   eval_moleculeqa_sample_size: 1000
   eval_pampa_path: "/home/haoqian/Data/Molecule/Molecule/Baselines/Mol-LLaMA/pampa/data/pampa.json"
   eval_pampa_sample_size: 1000
+  # Build validation from train samples that were NOT selected by subset.
+  eval_from_train_holdout: true
 
   # Training subset control (for quick ablations/debug).
   # 1.0 means use all training data, 0.5 means use 50%.

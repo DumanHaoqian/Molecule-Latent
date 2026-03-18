@@ -110,6 +110,8 @@ def main():
         eval_moleculeqa_sample_size=int(_cfg_get(data_cfg, "eval_moleculeqa_sample_size", 1000)),
         eval_pampa_path=str(_cfg_get(data_cfg, "eval_pampa_path", "")),
         eval_pampa_sample_size=int(_cfg_get(data_cfg, "eval_pampa_sample_size", 1000)),
+        enabled_sources=list(_cfg_get(data_cfg, "enabled_sources", ["pubchem", "conversation", "downstream"])),
+        eval_from_train_holdout=bool(_cfg_get(data_cfg, "eval_from_train_holdout", False)),
         train_subset_fraction=float(_cfg_get(data_cfg, "train_subset_fraction", 1.0)),
         train_subset_fraction_by_source=_to_plain(_cfg_get(data_cfg, "train_subset_fraction_by_source", {})),
         train_subset_seed=int(_cfg_get(data_cfg, "train_subset_seed", 42)),
