@@ -69,6 +69,9 @@ class Stage1Trainer(pl.LightningModule):
         self._val_metric_buckets = {}
         self._val_metric_counts = {}
         self._reg_key_to_idx = {}
+        self._fixed_binary_datasets = {"BACE", "BBBP", "HIV", "CLINTOX", "TOX21"}
+        self._binary_pos_token_ids = []
+        self._binary_neg_token_ids = []
 
         # WM regression normalization and molecular_weight curriculum.
         # Default stds roughly match common chemistry ranges; can be overridden in config.
@@ -94,6 +97,8 @@ class Stage1Trainer(pl.LightningModule):
         self.mw_warmup_end = float(getattr(stage1_cfg, "mw_warmup_end", 1.0))
         self.mw_warmup_steps = int(getattr(stage1_cfg, "mw_warmup_steps", 2000))
         self.non_mw_reg_scale = float(getattr(stage1_cfg, "non_mw_reg_scale", 0.5))
+
+        self._init_binary_label_token_ids()
     
     def maybe_autocast(self, dtype=torch.float16):
         # if on cpu, don't use autocast
@@ -240,6 +245,34 @@ class Stage1Trainer(pl.LightningModule):
         except (TypeError, ValueError):
             return None
 
+    def _init_binary_label_token_ids(self):
+        if self.tokenizer is None:
+            return
+        pos_forms = ["Yes", " yes", "Answer: Yes", "yes", " yes."]
+        neg_forms = ["No", " no", "Answer: No", "no", " no."]
+
+        def _collect(forms):
+            ids = set()
+            for s in forms:
+                tok = self.tokenizer(s, add_special_tokens=False).input_ids
+                if len(tok) > 0:
+                    ids.add(int(tok[-1]))
+            return sorted(ids)
+
+        self._binary_pos_token_ids = _collect(pos_forms)
+        self._binary_neg_token_ids = _collect(neg_forms)
+
+    def _binary_fixed_token_predict(self, step_logits_vec):
+        if len(self._binary_pos_token_ids) == 0 or len(self._binary_neg_token_ids) == 0:
+            return None, None
+        pos_scores = step_logits_vec[self._binary_pos_token_ids]
+        neg_scores = step_logits_vec[self._binary_neg_token_ids]
+        pos = float(torch.max(pos_scores).item())
+        neg = float(torch.max(neg_scores).item())
+        score = pos - neg
+        pred = 1 if score > 0 else 0
+        return pred, score
+
     def _binary_auc(self, y_true, y_score):
         # Rank-based AUC with tie handling.
         if len(y_true) == 0:
@@ -344,8 +377,18 @@ class Stage1Trainer(pl.LightningModule):
         task_regression_value = batch.get("task_regression_value", torch.zeros((batch_size,), dtype=torch.float32)).tolist()
         task_regression_mask = batch.get("task_regression_mask", torch.zeros((batch_size,), dtype=torch.bool)).tolist()
 
+        logit_shift = logits[:, :-1, :]
+        label_shift = labels[:, 1:]
+        valid_shift = label_shift != -100
+        first_pos = torch.full((batch_size,), -1, dtype=torch.long, device=logits.device)
+        for bi in range(batch_size):
+            pos = torch.nonzero(valid_shift[bi], as_tuple=False).flatten()
+            if pos.numel() > 0:
+                first_pos[bi] = int(pos[0].item())
+
         for i in range(batch_size):
             ds = str(task_name_list[i] or source_name)
+            ds_upper = ds.upper()
             kind = str(task_kind_list[i] or "")
             self._val_metric_buckets.setdefault(ds, {"binary_y": [], "binary_pred": [], "binary_score": [], "mcq_y": [], "mcq_pred": [], "reg_y": [], "reg_pred": []})
             pred_txt = pred_texts[i]
@@ -354,11 +397,18 @@ class Stage1Trainer(pl.LightningModule):
             if kind == "binary_classification":
                 y = int(task_label[i]) if i < len(task_label) else -1
                 if y in (0, 1):
-                    p = self._parse_binary_pred(pred_txt, ds)
-                    if p is not None:
+                    p, s = None, None
+                    if ds_upper in self._fixed_binary_datasets and int(first_pos[i].item()) >= 0:
+                        step_logits_vec = logit_shift[i, int(first_pos[i].item()), :]
+                        p, s = self._binary_fixed_token_predict(step_logits_vec)
+                    if p is None:
+                        p = self._parse_binary_pred(pred_txt, ds)
+                        if p is not None:
+                            s = float(p)
+                    if p is not None and s is not None:
                         self._val_metric_buckets[ds]["binary_y"].append(y)
                         self._val_metric_buckets[ds]["binary_pred"].append(int(p))
-                        self._val_metric_buckets[ds]["binary_score"].append(float(p))
+                        self._val_metric_buckets[ds]["binary_score"].append(float(s))
             elif kind == "mcq4":
                 y = str(task_label_text[i] or "").upper()
                 if y in ("A", "B", "C", "D"):

@@ -342,9 +342,10 @@ class UnifiedStage1Dataset(Dataset):
     def _task_token(self, sample):
         if not self.use_task_tokens:
             return ""
-        if self.task_type == "latent_world_modeling":
+        sample_task = sample.get("task_type", self.task_type)
+        if sample_task == "latent_world_modeling":
             return "[TASK:LATENT_WORLD_MODELING]"
-        if self.task_type == "conversation":
+        if sample_task == "conversation":
             return "[TASK:CONVERSATION]"
         task_name = (((sample.get("targets") or {}).get("task") or {}).get("task_name") or "UNKNOWN")
         return f"[TASK:DOWNSTREAM_{str(task_name).upper()}]"
@@ -352,13 +353,14 @@ class UnifiedStage1Dataset(Dataset):
     def _build_messages(self, sample):
         inp = sample.get("input") or {}
         tgt = sample.get("targets") or {}
+        sample_task = sample.get("task_type", self.task_type)
         system_prompt = inp.get("system_prompt") or self.default_system
         instruction = inp.get("instruction") or ""
         history = inp.get("conversation_history") or []
         text_target = tgt.get("text")
         if not isinstance(text_target, str):
             text_target = ""
-        if self.task_type == "downstream" and text_target.strip() == "":
+        if sample_task == "downstream" and text_target.strip() == "":
             task = tgt.get("task") or {}
             label_text = task.get("label_text")
             label = task.get("label")

@@ -99,6 +99,8 @@ class Stage1DM(LightningDataModule):
         eval_moleculeqa_sample_size: int = 1000,
         eval_pampa_path: str = "",
         eval_pampa_sample_size: int = 1000,
+        enabled_sources=None,
+        eval_from_train_holdout: bool = False,
         train_subset_fraction: float = 1.0,
         train_subset_fraction_by_source=None,
         train_subset_seed: int = 42,
@@ -131,6 +133,8 @@ class Stage1DM(LightningDataModule):
         self.eval_moleculeqa_sample_size = int(eval_moleculeqa_sample_size)
         self.eval_pampa_path = eval_pampa_path
         self.eval_pampa_sample_size = int(eval_pampa_sample_size)
+        self.enabled_sources = list(enabled_sources or ["pubchem", "conversation", "downstream"])
+        self.eval_from_train_holdout = bool(eval_from_train_holdout)
         self.train_subset_fraction = float(train_subset_fraction)
         self.train_subset_fraction_by_source = dict(train_subset_fraction_by_source or {})
         self.train_subset_seed = int(train_subset_seed)
@@ -179,6 +183,8 @@ class Stage1DM(LightningDataModule):
             resolved["downstream"] = [p for p in fallback_downstream if p]
 
         for source, paths in resolved.items():
+            if source not in self.enabled_sources:
+                continue
             if len(paths) == 0:
                 raise FileNotFoundError(f"[Stage1DM] no path configured for source '{source}'.")
             missing = [p for p in paths if not os.path.exists(p)]
@@ -196,7 +202,7 @@ class Stage1DM(LightningDataModule):
         print(f"[Stage1DM] active paths (downstream): {resolved_paths['downstream']}")
 
         datasets = {}
-        if resolved_paths["pubchem"]:
+        if "pubchem" in self.enabled_sources and resolved_paths["pubchem"]:
             datasets["pubchem"] = UnifiedStage1Dataset(
                 resolved_paths["pubchem"],
                 source_name="PubChemLatent",
@@ -206,7 +212,7 @@ class Stage1DM(LightningDataModule):
                 max_latent_slots=self.max_latent_slots,
                 use_task_tokens=self.use_task_tokens,
             )
-        if resolved_paths["conversation"]:
+        if "conversation" in self.enabled_sources and resolved_paths["conversation"]:
             datasets["conversation"] = UnifiedStage1Dataset(
                 resolved_paths["conversation"],
                 source_name="ComprehensiveConversation",
@@ -216,7 +222,7 @@ class Stage1DM(LightningDataModule):
                 max_latent_slots=self.max_latent_slots,
                 use_task_tokens=self.use_task_tokens,
             )
-        if resolved_paths["downstream"]:
+        if "downstream" in self.enabled_sources and resolved_paths["downstream"]:
             datasets["downstream"] = UnifiedStage1Dataset(
                 resolved_paths["downstream"],
                 source_name="DownstreamTasks",
@@ -231,6 +237,7 @@ class Stage1DM(LightningDataModule):
 
         # Optional train subset control: keep only a fraction of each source.
         # Useful for fast ablations (e.g. 50% training data).
+        holdout_samples = []
         if self.train_subset_fraction < 1.0 or len(self.train_subset_fraction_by_source) > 0:
             print(
                 f"[Stage1DM] applying train subset: global_fraction={self.train_subset_fraction}, "
@@ -251,9 +258,16 @@ class Stage1DM(LightningDataModule):
                     keep_n = 1
                 else:
                     keep_n = max(1, int(n_total * frac))
-                indices = torch.randperm(n_total, generator=g)[:keep_n].tolist()
-                reduced[source] = Subset(ds, indices)
+                perm = torch.randperm(n_total, generator=g).tolist()
+                keep_indices = perm[:keep_n]
+                holdout_indices = perm[keep_n:]
+                reduced[source] = Subset(ds, keep_indices)
                 print(f"[Stage1DM] subset source={source}: keep {keep_n}/{n_total} ({frac:.3f})")
+                if self.eval_from_train_holdout and len(holdout_indices) > 0 and hasattr(ds, "samples"):
+                    ds_samples = getattr(ds, "samples", [])
+                    for hi in holdout_indices:
+                        if 0 <= hi < len(ds_samples):
+                            holdout_samples.append(ds_samples[hi])
             datasets = reduced
 
         self._source_datasets = datasets
@@ -279,7 +293,20 @@ class Stage1DM(LightningDataModule):
         print(f"[Stage1DM] source weights: {self.source_sampling_weights}")
         print(f"[Stage1DM] steps_per_epoch: {approx_total_batches}")
 
-        if len(self.eval_downstream_csv_paths) > 0:
+        if self.eval_from_train_holdout and len(holdout_samples) > 0:
+            print(f"[Stage1DM] building val set from train holdout samples: {len(holdout_samples)}")
+            self.val_dataset = UnifiedStage1Dataset(
+                data_paths=[],
+                source_name="Stage1HoldoutEval",
+                task_type="downstream",
+                unimol_dictionary=self.unimol_dictionary,
+                encoder_types=self.encoder_types,
+                max_latent_slots=self.max_latent_slots,
+                use_task_tokens=self.use_task_tokens,
+                preloaded_samples=holdout_samples,
+            )
+            print(f"[Stage1DM] holdout eval size: {len(self.val_dataset)}")
+        elif len(self.eval_downstream_csv_paths) > 0:
             eval_samples = build_downstream_eval_samples_from_csv(
                 self.eval_downstream_csv_paths,
                 sample_per_dataset=self.eval_sample_per_dataset,

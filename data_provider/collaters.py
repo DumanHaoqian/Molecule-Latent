@@ -90,10 +90,8 @@ class Stage1UnifiedCollater:
         source_dataset = [info.get("source_dataset", "unknown") for info in other_infos]
         smiles = [info.get("smiles", "") for info in other_infos]
         sample_ids = [info.get("sample_id", None) for info in other_infos]
-        # Weighted source sampler should keep task-type pure at batch level.
-        if len(set(task_types)) > 1:
-            raise RuntimeError(f"Stage1 batch has mixed task types: {set(task_types)}")
-        task_type = task_types[0]
+        # Train sampler should usually keep task-type pure; validation may mix tasks.
+        task_type = task_types[0] if len(set(task_types)) == 1 else "mixed"
 
         # latent slot descriptors -> tokenized targets for latent alignment
         latent_slot_mask = torch.zeros((batch_size, self.max_latent_slots), dtype=torch.bool)
