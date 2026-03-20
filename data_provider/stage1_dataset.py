@@ -766,3 +766,88 @@ def build_pampa_eval_samples(pampa_json_path, sample_size=1000, seed=42):
         )
     print(f"[Stage1Eval] PAMPA: picked {len(samples)} samples from {pampa_json_path}")
     return samples
+
+
+def _safe_parse_json_obj(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            obj = json.loads(value)
+            return obj if isinstance(obj, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def build_moledit_eval_samples_from_json(json_paths, sample_per_task=0, seed=42):
+    """
+    Build MolEdit eval samples from add/delete/sub json files.
+    sample_per_task <= 0 means using all samples per task file.
+    """
+    rng = random.Random(seed)
+    all_samples = []
+    for path in json_paths:
+        if not isinstance(path, str) or len(path) == 0:
+            continue
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"MolEdit eval json not found: {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, list):
+            raise RuntimeError(f"MolEdit eval file should be a JSON list: {path}")
+
+        task_name = os.path.splitext(os.path.basename(path))[0].lower()
+        rows = [x for x in data if isinstance(x, dict)]
+        if sample_per_task is not None and int(sample_per_task) > 0 and len(rows) > int(sample_per_task):
+            rows = rng.sample(rows, int(sample_per_task))
+
+        picked = 0
+        for i, item in enumerate(rows):
+            meta = _safe_parse_json_obj(item.get("meta"))
+            src = (meta.get("molecule") or "").strip()
+            tgt = (meta.get("reference") or "").strip()
+            if len(src) == 0:
+                continue
+            all_samples.append(
+                {
+                    "sample_id": item.get("id") or f"moledit_{task_name}_{i}",
+                    "source_dataset": f"MolEditTest_{task_name}",
+                    "split": "test",
+                    "task_type": "downstream",
+                    "stage_tags": ["stage1", "stage3"],
+                    "molecule": {"smiles": src, "canonical_smiles": src, "iupac_name": None},
+                    "input": {
+                        "system_prompt": "You are a helpful assistant specializing in chemistry and biology.",
+                        "instruction": item.get("query", ""),
+                        "conversation_history": [],
+                    },
+                    "targets": {
+                        "text": tgt,
+                        "latent": {"slots": []},
+                        "properties": {"regression": {}, "classification": {}},
+                        "task": {
+                            "task_name": "MolEdit",
+                            "task_kind": f"mol_edit_{task_name}",
+                            "label": None,
+                            "label_text": None,
+                            "value": None,
+                        },
+                    },
+                    "quality": {"quality_score": None, "quality_label": "test"},
+                    "meta": {
+                        "has_latent_target": False,
+                        "has_text_target": True,
+                        "has_property_target": False,
+                        "has_task_label": False,
+                        "source_smiles": src,
+                        "target_smiles": tgt,
+                        "edit_type": task_name,
+                        "added_group": meta.get("added_group"),
+                        "removed_group": meta.get("removed_group"),
+                    },
+                }
+            )
+            picked += 1
+        print(f"[Stage1Eval] MolEdit {task_name}: picked {picked}/{len(rows)} samples from {path}")
+    return all_samples

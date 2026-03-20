@@ -3,6 +3,7 @@ import csv
 import os
 import re
 from collections import defaultdict
+from types import SimpleNamespace
 
 import pytorch_lightning as pl
 import torch
@@ -51,7 +52,7 @@ class Stage1Trainer(pl.LightningModule):
         self.lambda_lm = float(getattr(train_config, "loss_weights", {}).get("lm", 0.1))
         self.source_counter = defaultdict(int)
         self.task_to_id = {"latent_world_modeling": 0, "conversation": 1}
-        self.source_to_id = {"PubChemLatent": 0, "ComprehensiveConversation": 1}
+        self.source_to_id = {"PubChemLatent": 0, "ComprehensiveConversation": 1, "MolEditLatent": 2}
         self.stage1_cfg = getattr(train_config, "stage1", {})
         self.test_results_csv_path = str(
             getattr(
@@ -69,6 +70,11 @@ class Stage1Trainer(pl.LightningModule):
         self._fixed_binary_datasets = {"BACE", "BBBP", "HIV", "CLINTOX", "TOX21"}
         self._binary_pos_token_ids = []
         self._binary_neg_token_ids = []
+        self.latent_viz_every_n_steps = int(getattr(stage1_cfg, "latent_viz_every_n_steps", 500))
+        self.latent_viz_max_samples = int(getattr(stage1_cfg, "latent_viz_max_samples", 8))
+        self.latent_viz_out_dir = str(
+            getattr(stage1_cfg, "latent_viz_out_dir", "/home/haoqian/Data/Molecule/Latent/latent_viz")
+        )
 
         # WM regression normalization and molecular_weight curriculum.
         # Default stds roughly match common chemistry ranges; can be overridden in config.
@@ -294,11 +300,287 @@ class Stage1Trainer(pl.LightningModule):
         auc = (sum_pos_ranks - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
         return float(auc)
 
+    def _canonicalize_smiles(self, smiles):
+        if not isinstance(smiles, str) or len(smiles.strip()) == 0:
+            return None
+        try:
+            from rdkit import Chem
+
+            mol = Chem.MolFromSmiles(smiles.strip())
+            if mol is None:
+                return None
+            return Chem.MolToSmiles(mol, canonical=True)
+        except Exception:
+            return None
+
+    def _extract_predicted_smiles_from_text(self, text):
+        if not isinstance(text, str):
+            return None
+        m = re.search(r"<answer>\s*([^<]+?)\s*</answer>", text, flags=re.IGNORECASE | re.DOTALL)
+        if m:
+            can = self._canonicalize_smiles(m.group(1).strip())
+            if can is not None:
+                return can
+        toks = re.findall(r"[A-Za-z0-9@+\-\[\]\(\)=#$\\/%.]+", text)
+        toks = sorted(set(toks), key=len, reverse=True)
+        for tok in toks:
+            can = self._canonicalize_smiles(tok)
+            if can is not None:
+                return can
+        return None
+
+    def _count_group_from_smiles(self, smiles, group):
+        GROUP_TO_SMARTS = {
+            "benzene": "[cR1]1[cR1][cR1][cR1][cR1][cR1]1",
+            "benzene_ring": "[cR1]1[cR1][cR1][cR1][cR1][cR1]1",
+            "hydroxyl": "[OX2H]",
+            "aldehyde": "[CX3H1](=O)[#6]",
+            "ketone": "[#6][CX3](=O)[#6]",
+            "carboxyl": "[CX3](=O)[OX2H1]",
+            "ester": "[#6][CX3](=O)[OX2H0][#6]",
+            "anhydride": "[CX3](=[OX1])[OX2][CX3](=[OX1])",
+            "amine": "[NX3;H2,H1;!$(NC=O)]",
+            "amide": "[NX3][CX3](=[OX1])[#6]",
+            "nitro": "[$([NX3](=O)=O),$([NX3+](=O)[O-])][!#8]",
+            "halo": "[F,Cl,Br,I]",
+            "thiol": "[#16X2H]",
+            "thioether": "[SX2][CX4]",
+            "disulfide": "[#16X2H0][#16X2H0]",
+            "sulfoxide": "[$([#16X3]=[OX1]),$([#16X3+][OX1-])]",
+            "sulfone": "[$([#16X4](=[OX1])=[OX1]),$([#16X4+2]([OX1-])[OX1-])]",
+            "sulfide": "[#16X2H0]",
+            "nitrile": "[NX1]#[CX2]",
+            "borane": "[BX3]",
+        }
+        alias = {"benzene ring": "benzene_ring", "benzene-ring": "benzene_ring"}
+        g = str(group or "").strip().lower().replace(".", "")
+        g = alias.get(g, g).replace(" ", "_")
+        if g not in GROUP_TO_SMARTS:
+            return None
+        try:
+            from rdkit import Chem
+
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                return None
+            patt = Chem.MolFromSmarts(GROUP_TO_SMARTS[g])
+            if patt is None:
+                return None
+            matches = mol.GetSubstructMatches(patt)
+            if g == "sulfide":
+                disulfide = Chem.MolFromSmarts(GROUP_TO_SMARTS["disulfide"])
+                disulfide_matches = mol.GetSubstructMatches(disulfide)
+                return max(0, len(matches) - len(disulfide_matches))
+            return len(matches)
+        except Exception:
+            return None
+
+    def _check_moledit_correct(self, subtask, src, pred, add_group, remove_group):
+        if subtask == "add":
+            s0 = self._count_group_from_smiles(src, add_group)
+            s1 = self._count_group_from_smiles(pred, add_group)
+            return s0 is not None and s1 is not None and s1 == s0 + 1
+        if subtask == "delete":
+            s0 = self._count_group_from_smiles(src, remove_group)
+            s1 = self._count_group_from_smiles(pred, remove_group)
+            return s0 is not None and s1 is not None and s1 == s0 - 1
+        if subtask == "sub":
+            a0 = self._count_group_from_smiles(src, add_group)
+            a1 = self._count_group_from_smiles(pred, add_group)
+            r0 = self._count_group_from_smiles(src, remove_group)
+            r1 = self._count_group_from_smiles(pred, remove_group)
+            return (
+                a0 is not None and a1 is not None and r0 is not None and r1 is not None
+                and a1 == a0 + 1 and r1 == r0 - 1
+            )
+        return False
+
+    def _project_points_2d(self, points):
+        # points: torch.Tensor [N, D]
+        if points.size(0) <= 2:
+            out = torch.zeros((points.size(0), 2), dtype=torch.float32, device=points.device)
+            if points.size(0) == 2:
+                out[1, 0] = 1.0
+            return out
+        # Prefer UMAP when available; fallback to PCA via torch.
+        try:
+            import umap  # type: ignore
+
+            emb = umap.UMAP(n_components=2, random_state=42).fit_transform(points.detach().cpu().float().numpy())
+            return torch.tensor(emb, dtype=torch.float32, device=points.device)
+        except Exception:
+            pts = points.detach().float()
+            centered = pts - pts.mean(dim=0, keepdim=True)
+            q = min(2, centered.size(1))
+            u, s, _ = torch.pca_lowrank(centered, q=q)
+            proj = centered @ _[:, :2]
+            if proj.size(1) < 2:
+                pad = torch.zeros((proj.size(0), 2 - proj.size(1)), device=proj.device, dtype=proj.dtype)
+                proj = torch.cat([proj, pad], dim=1)
+            return proj
+
+    @torch.no_grad()
+    def _save_latent_visualization(self, outputs, batch):
+        if self.latent_viz_every_n_steps <= 0:
+            return
+        if (self.global_step % self.latent_viz_every_n_steps) != 0:
+            return
+        if not self.trainer.is_global_zero:
+            return
+        try:
+            import numpy as np
+            import matplotlib.pyplot as plt
+        except Exception:
+            return
+
+        latent_all = outputs.get("latent_states_all", None)
+        latent_states = outputs.get("latent_states", None)
+        slot_targets = outputs.get("slot_targets", None)
+        slot_mask = batch.get("latent_slot_mask", None)
+        if latent_all is None or latent_states is None or slot_targets is None or slot_mask is None:
+            return
+
+        bsz = int(latent_all.shape[0])
+        if bsz <= 0:
+            return
+        keep_n = max(1, min(self.latent_viz_max_samples, bsz))
+        latent_all = latent_all[:keep_n].detach().float().cpu()
+        latent_states = latent_states[:keep_n].detach().float().cpu()
+        slot_targets = slot_targets[:keep_n].detach().float().cpu()
+        slot_mask = slot_mask[:keep_n].detach().cpu()
+
+        sample_ids = list(batch.get("sample_ids", []))[:keep_n]
+        source_datasets = list(batch.get("source_dataset", []))[:keep_n]
+        task_type = str(batch.get("task_type", "unknown"))
+
+        out_dir = os.path.join(self.latent_viz_out_dir, f"step_{int(self.global_step):08d}")
+        os.makedirs(out_dir, exist_ok=True)
+
+        np.savez_compressed(
+            os.path.join(out_dir, "latent_dump.npz"),
+            latent_states_all=latent_all.numpy(),
+            latent_states=latent_states.numpy(),
+            slot_targets=slot_targets.numpy(),
+            slot_mask=slot_mask.numpy(),
+            sample_ids=np.array(sample_ids, dtype=object),
+            source_dataset=np.array(source_datasets, dtype=object),
+            task_type=np.array([task_type], dtype=object),
+        )
+
+        # 1) UMAP/PCA plot by latent step using latent_states_all.
+        b, k, d = latent_all.shape
+        flat = latent_all.reshape(b * k, d)
+        coords = self._project_points_2d(flat).cpu().numpy()
+        step_ids = np.tile(np.arange(k), b)
+        fig = plt.figure(figsize=(7, 6))
+        ax = fig.add_subplot(111)
+        cmap = plt.get_cmap("viridis", k)
+        for s in range(k):
+            idx = step_ids == s
+            ax.scatter(coords[idx, 0], coords[idx, 1], s=14, alpha=0.8, color=cmap(s), label=f"step_{s}")
+        ax.set_title(f"Latent trajectory by step (global_step={int(self.global_step)})")
+        ax.set_xlabel("dim-1")
+        ax.set_ylabel("dim-2")
+        ax.legend(ncol=2, fontsize=7)
+        fig.tight_layout()
+        fig.savefig(os.path.join(out_dir, "umap_latent_by_step.png"), dpi=180)
+        plt.close(fig)
+
+        # 2) Heatmap for each sample: cosine(latent_states, slot_targets)
+        summary_rows = []
+        for i in range(keep_n):
+            valid_idx = torch.nonzero(slot_mask[i], as_tuple=False).flatten()
+            if valid_idx.numel() == 0:
+                continue
+            z = F.normalize(latent_states[i, valid_idx, :], dim=-1)
+            t = F.normalize(slot_targets[i, valid_idx, :], dim=-1)
+            sim = z @ t.transpose(0, 1)  # [S, S]
+            sim_np = sim.numpy()
+
+            fig = plt.figure(figsize=(5, 4))
+            ax = fig.add_subplot(111)
+            im = ax.imshow(sim_np, vmin=-1.0, vmax=1.0, cmap="coolwarm", aspect="auto")
+            ax.set_title(f"Alignment sample_{i} (S={sim_np.shape[0]})")
+            ax.set_xlabel("slot target j")
+            ax.set_ylabel("latent token i")
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            fig.tight_layout()
+            fig.savefig(os.path.join(out_dir, f"heatmap_alignment_sample_{i}.png"), dpi=180)
+            plt.close(fig)
+
+            diag = sim.diag()
+            summary_rows.append(
+                {
+                    "global_step": int(self.global_step),
+                    "sample_index": i,
+                    "sample_id": sample_ids[i] if i < len(sample_ids) else "",
+                    "source_dataset": source_datasets[i] if i < len(source_datasets) else "",
+                    "task_type": task_type,
+                    "num_valid_slots": int(valid_idx.numel()),
+                    "diag_cos_mean": float(diag.mean().item()),
+                    "diag_cos_min": float(diag.min().item()),
+                    "diag_cos_max": float(diag.max().item()),
+                    "all_cos_mean": float(sim.mean().item()),
+                }
+            )
+
+        csv_path = os.path.join(out_dir, "summary_alignment.csv")
+        if len(summary_rows) > 0:
+            with open(csv_path, "w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(summary_rows[0].keys()))
+                writer.writeheader()
+                for row in summary_rows:
+                    writer.writerow(row)
+        print(f"[LatentViz] saved visualization artifacts to {out_dir}")
+
+    @torch.no_grad()
+    def _generate_moledit_pred_text(self, batch, sample_idx):
+        input_ids = batch["input_ids"][sample_idx]
+        attn = batch["attention_mask"][sample_idx]
+        labels = batch["labels"][sample_idx]
+        mol_flag = batch["mol_token_flag"][sample_idx]
+        valid_labels = torch.nonzero((labels != -100) & (attn > 0), as_tuple=False).flatten()
+        if valid_labels.numel() == 0:
+            return ""
+        first_label_pos = int(valid_labels[0].item())
+        if first_label_pos <= 0:
+            return ""
+
+        prompt_ids = input_ids[:first_label_pos].unsqueeze(0)
+        prompt_attn = torch.ones_like(prompt_ids, dtype=attn.dtype, device=attn.device)
+        prompt_mol_flag = mol_flag[:first_label_pos].unsqueeze(0)
+        prompt_batch = SimpleNamespace(
+            input_ids=prompt_ids,
+            attention_mask=prompt_attn,
+            mol_token_flag=prompt_mol_flag,
+        )
+
+        smiles = batch["smiles"][sample_idx] if sample_idx < len(batch["smiles"]) else None
+        if isinstance(self.tokenizer.name_or_path, str) and "Llama-3" in self.tokenizer.name_or_path:
+            eos_token_id = [self.tokenizer.eos_token_id, self.tokenizer.convert_tokens_to_ids("<|eot_id|>")]
+        else:
+            eos_token_id = self.tokenizer.eos_token_id
+
+        outputs = self.mol_llama.generate_with_smiles(
+            smiles_list=[smiles] if isinstance(smiles, str) and len(smiles) > 0 else [],
+            text_batch=prompt_batch,
+            do_sample=False,
+            temperature=0.7,
+            top_p=0.9,
+            max_new_tokens=256,
+            min_new_tokens=8,
+            repetition_penalty=1.1,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=eos_token_id,
+        )
+        text = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0].strip()
+        return text
+
     def training_step(self, batch, batch_idx):
         task_type = batch["task_type"]
         if task_type not in {"latent_world_modeling", "conversation"}:
             raise ValueError(
-                f"Stage-I training only supports pubchem/conversation tasks, got task_type={task_type}"
+                f"Stage-I training only supports latent_world_modeling/conversation tasks, got task_type={task_type}"
             )
         source_name = batch["source_dataset"][0] if len(batch["source_dataset"]) > 0 else "unknown"
         self.source_counter[source_name] += 1
@@ -306,6 +588,7 @@ class Stage1Trainer(pl.LightningModule):
             self.scheduler.step(self.trainer.current_epoch, self.trainer.global_step)
         batch_size = batch["input_ids"].size(0)
         outputs = self.mol_llama.forward_stage1(batch)
+        self._save_latent_visualization(outputs, batch)
 
         lm_loss = outputs["lm_loss"] if outputs["lm_loss"] is not None else torch.tensor(0.0, device=self.device)
         latent_loss = self._compute_latent_loss(
@@ -378,7 +661,15 @@ class Stage1Trainer(pl.LightningModule):
             ds = str(task_name_list[i] or source_name)
             ds_upper = ds.upper()
             kind = str(task_kind_list[i] or "")
-            self._val_metric_buckets.setdefault(ds, {"binary_y": [], "binary_pred": [], "binary_score": [], "mcq_y": [], "mcq_pred": [], "reg_y": [], "reg_pred": []})
+            self._val_metric_buckets.setdefault(
+                ds,
+                {
+                    "binary_y": [], "binary_pred": [], "binary_score": [],
+                    "mcq_y": [], "mcq_pred": [],
+                    "reg_y": [], "reg_pred": [],
+                    "moledit_total": 0, "moledit_valid": 0, "moledit_exact": 0, "moledit_correct": 0,
+                },
+            )
             pred_txt = pred_texts[i]
             gold_txt = gold_texts[i] if i < len(gold_texts) else ""
 
@@ -412,6 +703,29 @@ class Stage1Trainer(pl.LightningModule):
                     if p is not None:
                         self._val_metric_buckets[ds]["reg_y"].append(y)
                         self._val_metric_buckets[ds]["reg_pred"].append(float(p))
+            elif isinstance(kind, str) and kind.startswith("mol_edit_"):
+                subtask = kind.replace("mol_edit_", "")
+                meta_info = batch.get("meta_info", [{} for _ in range(batch_size)])
+                meta = meta_info[i] if i < len(meta_info) and isinstance(meta_info[i], dict) else {}
+                src = self._canonicalize_smiles(meta.get("source_smiles") or batch["smiles"][i])
+                tgt = self._canonicalize_smiles(meta.get("target_smiles") or gold_txt)
+                gen_txt = self._generate_moledit_pred_text(batch, i)
+                pred_smiles = self._extract_predicted_smiles_from_text(gen_txt)
+                is_valid = pred_smiles is not None
+                is_exact = bool(is_valid and tgt is not None and pred_smiles == tgt)
+                is_correct = False
+                if is_valid and src is not None:
+                    is_correct = self._check_moledit_correct(
+                        subtask=subtask,
+                        src=src,
+                        pred=pred_smiles,
+                        add_group=meta.get("added_group"),
+                        remove_group=meta.get("removed_group"),
+                    )
+                self._val_metric_buckets[ds]["moledit_total"] += 1
+                self._val_metric_buckets[ds]["moledit_valid"] += int(is_valid)
+                self._val_metric_buckets[ds]["moledit_exact"] += int(is_exact)
+                self._val_metric_buckets[ds]["moledit_correct"] += int(is_correct)
 
         self.log("val/loss", lm_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
         self.log("val/score", score, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
@@ -453,6 +767,7 @@ class Stage1Trainer(pl.LightningModule):
         all_bin_y, all_bin_p, all_bin_s = [], [], []
         all_mcq_y, all_mcq_p = [], []
         all_reg_y, all_reg_p = [], []
+        all_me_total, all_me_valid, all_me_exact, all_me_correct = 0, 0, 0, 0
         for ds, bucket in self._val_metric_buckets.items():
             by, bp, bs = bucket["binary_y"], bucket["binary_pred"], bucket["binary_score"]
             my, mp = bucket["mcq_y"], bucket["mcq_pred"]
@@ -481,6 +796,24 @@ class Stage1Trainer(pl.LightningModule):
                 row[f"val_mae_{ds}"] = mae
                 row[f"val_rmse_{ds}"] = rmse
                 all_reg_y.extend(ry); all_reg_p.extend(rp)
+            me_total = int(bucket.get("moledit_total", 0))
+            if me_total > 0:
+                me_valid = int(bucket.get("moledit_valid", 0))
+                me_exact = int(bucket.get("moledit_exact", 0))
+                me_correct = int(bucket.get("moledit_correct", 0))
+                valid_rate = float(me_valid / me_total)
+                exact_rate = float(me_exact / me_total)
+                correct_rate = float(me_correct / me_total)
+                self.log(f"val/moledit_valid_rate_{ds}", valid_rate, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+                self.log(f"val/moledit_exact_match_rate_{ds}", exact_rate, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+                self.log(f"val/moledit_correct_rate_{ds}", correct_rate, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+                row[f"val_moledit_valid_rate_{ds}"] = valid_rate
+                row[f"val_moledit_exact_match_rate_{ds}"] = exact_rate
+                row[f"val_moledit_correct_rate_{ds}"] = correct_rate
+                all_me_total += me_total
+                all_me_valid += me_valid
+                all_me_exact += me_exact
+                all_me_correct += me_correct
 
         if len(all_bin_y) > 0:
             acc = float(sum(int(a == b) for a, b in zip(all_bin_p, all_bin_y)) / len(all_bin_y))
@@ -503,6 +836,16 @@ class Stage1Trainer(pl.LightningModule):
             self.log("val/rmse", rmse, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
             row["val_mae"] = mae
             row["val_rmse"] = rmse
+        if all_me_total > 0:
+            me_valid_rate = float(all_me_valid / all_me_total)
+            me_exact_rate = float(all_me_exact / all_me_total)
+            me_correct_rate = float(all_me_correct / all_me_total)
+            self.log("val/moledit_valid_rate", me_valid_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
+            self.log("val/moledit_exact_match_rate", me_exact_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
+            self.log("val/moledit_correct_rate", me_correct_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
+            row["val_moledit_valid_rate"] = me_valid_rate
+            row["val_moledit_exact_match_rate"] = me_exact_rate
+            row["val_moledit_correct_rate"] = me_correct_rate
 
         # Add dynamic per-dataset val metrics (e.g. BACE/BBBP/HIV/Clintox/Delaney/LIPO/Tox21).
         for k in list(metrics.keys()):

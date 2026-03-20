@@ -1,63 +1,28 @@
-num_workers: 8
-batch_size: 2
-text_max_len: 512
-root: ""
-
-latent_world_modeling_path: /home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/latent_world_modeling.jsonl
-conversation_sft_path: /home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/conversation_sft.jsonl
-downstream_tasks_path: /home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/downstream_tasks.jsonl
-
 data:
   num_workers: 8
   batch_size: 2
   text_max_len: 512
 
-  latent_path: "/home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/latent_world_modeling.jsonl"
-  conversation_path: "/home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/conversation_sft.jsonl"
-  downstream_paths: []
-
-  fallback_raw_paths:
-    latent_path: "/home/haoqian/Data/Molecule/Construction/Datasets/SFT/pubchem_17k.jsonl"
-    conversation_path: "/home/haoqian/Data/Molecule/Construction/Datasets/SFT/conversations_2k.json"
-    downstream_paths:
-      - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed_with_subgraphs/BACE/train.jsonl"
-      - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed_with_subgraphs/BBBP/train.jsonl"
-      - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed_with_subgraphs/Clintox/train.jsonl"
-      - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed_with_subgraphs/HIV/train.jsonl"
+  latent_path: "/home/haoqian/Data/Molecule/Datasets/Train/02PubChem/latent_world_modeling.jsonl"
+  conversation_path: "/home/haoqian/Data/Molecule/Datasets/Train/01Conversation/conversation_sft_with_worldmodel.jsonl"
+  moledit_path: "/home/haoqian/Data/Molecule/Datasets/Train/03MolEdit/mol_edit_with_worldmodel.jsonl"
 
   source_sampling_weights:
-    pubchem: 0.8
-    conversation: 0.2
+    pubchem: 0.4
+    conversation: 0.3
+    moledit: 0.3
 
-  # Restrict Stage-I to these training sources only.
   enabled_sources:
     - pubchem
     - conversation
+    - moledit
 
-  eval_downstream_csv_paths:
-    - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/BACE/split/test.csv"
-    - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/BBBP/split/test.csv"
-    - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/HIV/split/test.csv"
-    - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/Clintox/split/test.csv"
-    - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/Delaney/split/test.csv"
-    - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/LIPO/split/test.csv"
-    - "/home/haoqian/Data/Molecule/Construction/Datasets/Downstram/processed/Tox21/split/test.csv"
-  eval_sample_per_dataset: 200
-  eval_stratified_sampling: true
-  eval_sample_per_class: 100
-  eval_seed: 42
-  eval_moleculeqa_test_path: "/home/haoqian/Data/Molecule/Molecule/Baselines/Mol-LLaMA/data/moleculeqa/test.json"
-  eval_moleculeqa_test_mol_path: "/home/haoqian/Data/Molecule/Molecule/Baselines/Mol-LLaMA/data/moleculeqa/test_mol.json"
-  eval_moleculeqa_sample_size: 1000
-  eval_pampa_path: "/home/haoqian/Data/Molecule/Molecule/Baselines/Mol-LLaMA/pampa/data/pampa.json"
-  eval_pampa_sample_size: 1000
-  # Build validation from train samples that were NOT selected by subset.
-  eval_from_train_holdout: true
+  # Keep disabled in default training.
+  eval_from_train_holdout: false
+  eval_moledit_test_paths: []
+  eval_moledit_sample_per_task: 0
 
-  # Training subset control (for quick ablations/debug).
-  # 1.0 means use all training data, 0.5 means use 50%.
-  train_subset_fraction: 0.3
-  # Optional per-source override. Keys: pubchem / conversation / downstream
-  train_subset_fraction_by_source: {}
-  train_subset_seed: 42
-
+  source_train_fraction: 0.8
+  total_data_fraction: 1.0
+  total_data_fraction_by_source: {}
+  split_seed: 421

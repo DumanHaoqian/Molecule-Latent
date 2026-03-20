@@ -9,6 +9,7 @@ from data_provider.collaters import Stage1UnifiedCollater
 from data_provider.stage1_dataset import (
     UnifiedStage1Dataset,
     build_downstream_eval_samples_from_csv,
+    build_moledit_eval_samples_from_json,
     build_moleculeqa_eval_samples,
     build_pampa_eval_samples,
 )
@@ -83,6 +84,7 @@ class Stage1DM(LightningDataModule):
         stage1_mixed_training: bool = True,
         latent_world_modeling_path: str = "",
         conversation_sft_path: str = "",
+        moledit_path: str = "",
         downstream_tasks_paths=None,
         fallback_raw_paths=None,
         source_sampling_weights=None,
@@ -99,8 +101,14 @@ class Stage1DM(LightningDataModule):
         eval_moleculeqa_sample_size: int = 1000,
         eval_pampa_path: str = "",
         eval_pampa_sample_size: int = 1000,
+        eval_moledit_test_paths=None,
+        eval_moledit_sample_per_task: int = 0,
         enabled_sources=None,
         eval_from_train_holdout: bool = False,
+        source_train_fraction: float = 0.8,
+        total_data_fraction: float = 1.0,
+        total_data_fraction_by_source=None,
+        split_seed: int = 42,
         train_subset_fraction: float = 1.0,
         train_subset_fraction_by_source=None,
         train_subset_seed: int = 42,
@@ -133,45 +141,62 @@ class Stage1DM(LightningDataModule):
         self.eval_moleculeqa_sample_size = int(eval_moleculeqa_sample_size)
         self.eval_pampa_path = eval_pampa_path
         self.eval_pampa_sample_size = int(eval_pampa_sample_size)
-        requested_sources = list(enabled_sources or ["pubchem", "conversation"])
-        # Stage-I training scope is restricted to pubchem + conversation.
-        self.enabled_sources = [s for s in requested_sources if s in {"pubchem", "conversation"}]
+        if isinstance(eval_moledit_test_paths, str):
+            eval_moledit_test_paths = [eval_moledit_test_paths]
+        self.eval_moledit_test_paths = list(eval_moledit_test_paths or [])
+        self.eval_moledit_sample_per_task = int(eval_moledit_sample_per_task)
+        requested_sources = list(enabled_sources or ["pubchem", "conversation", "moledit"])
+        # Stage-I training sources.
+        self.enabled_sources = [s for s in requested_sources if s in {"pubchem", "conversation", "moledit"}]
         if len(self.enabled_sources) == 0:
-            self.enabled_sources = ["pubchem", "conversation"]
+            self.enabled_sources = ["pubchem", "conversation", "moledit"]
         self.eval_from_train_holdout = bool(eval_from_train_holdout)
-        self.train_subset_fraction = float(train_subset_fraction)
-        self.train_subset_fraction_by_source = dict(train_subset_fraction_by_source or {})
-        self.train_subset_seed = int(train_subset_seed)
+        self.source_train_fraction = float(source_train_fraction)
+        self.total_data_fraction = float(total_data_fraction)
+        self.total_data_fraction_by_source = dict(total_data_fraction_by_source or {})
+        self.split_seed = int(split_seed)
+        # Backward-compatible aliases (old configs).
+        if train_subset_fraction is not None:
+            self.total_data_fraction = float(train_subset_fraction)
+        if train_subset_fraction_by_source:
+            self.total_data_fraction_by_source.update(dict(train_subset_fraction_by_source))
+        if train_subset_seed is not None:
+            self.split_seed = int(train_subset_seed)
 
         self.latent_world_modeling_path = latent_world_modeling_path
         self.conversation_sft_path = conversation_sft_path
+        self.moledit_path = moledit_path
         if isinstance(downstream_tasks_paths, str):
             downstream_tasks_paths = [downstream_tasks_paths]
         self.downstream_tasks_paths = list(downstream_tasks_paths or [])
         self.fallback_raw_paths = fallback_raw_paths or {}
         self.source_sampling_weights = source_sampling_weights or {
-            "pubchem": 0.8,
+            "pubchem": 0.6,
             "conversation": 0.2,
+            "moledit": 0.2,
         }
-        self.source_sample_counter = {"pubchem": 0, "conversation": 0}
+        self.source_sample_counter = {"pubchem": 0, "conversation": 0, "moledit": 0}
 
         self.train_dataset = None
         self.train_batch_sampler = None
         self.val_dataset = None
 
     def _resolve_source_paths(self):
-        resolved = {"pubchem": [], "conversation": [], "downstream": []}
+        resolved = {"pubchem": [], "conversation": [], "moledit": [], "downstream": []}
         # Primary unified paths
         if self.latent_world_modeling_path:
             resolved["pubchem"] = [self.latent_world_modeling_path]
         if self.conversation_sft_path:
             resolved["conversation"] = [self.conversation_sft_path]
+        if self.moledit_path:
+            resolved["moledit"] = [self.moledit_path]
         if self.downstream_tasks_paths:
             resolved["downstream"] = [p for p in self.downstream_tasks_paths if p]
 
         # Fallback raw paths
         fallback_latent = self.fallback_raw_paths.get("latent_path", "")
         fallback_conversation = self.fallback_raw_paths.get("conversation_path", "")
+        fallback_moledit = self.fallback_raw_paths.get("moledit_path", "")
         fallback_downstream = self.fallback_raw_paths.get("downstream_paths", [])
         if isinstance(fallback_downstream, str):
             fallback_downstream = [fallback_downstream]
@@ -182,6 +207,9 @@ class Stage1DM(LightningDataModule):
         if (not resolved["conversation"]) or (not all(os.path.exists(p) for p in resolved["conversation"])):
             if fallback_conversation:
                 resolved["conversation"] = [fallback_conversation]
+        if (not resolved["moledit"]) or (not all(os.path.exists(p) for p in resolved["moledit"])):
+            if fallback_moledit:
+                resolved["moledit"] = [fallback_moledit]
         if (not resolved["downstream"]) or (not all(os.path.exists(p) for p in resolved["downstream"])):
             resolved["downstream"] = [p for p in fallback_downstream if p]
 
@@ -202,6 +230,7 @@ class Stage1DM(LightningDataModule):
         resolved_paths = self._resolve_source_paths()
         print(f"[Stage1DM] active paths (pubchem): {resolved_paths['pubchem']}")
         print(f"[Stage1DM] active paths (conversation): {resolved_paths['conversation']}")
+        print(f"[Stage1DM] active paths (moledit): {resolved_paths['moledit']}")
         print(f"[Stage1DM] active paths (downstream): {resolved_paths['downstream']}")
 
         datasets = {}
@@ -225,6 +254,16 @@ class Stage1DM(LightningDataModule):
                 max_latent_slots=self.max_latent_slots,
                 use_task_tokens=self.use_task_tokens,
             )
+        if "moledit" in self.enabled_sources and resolved_paths["moledit"]:
+            datasets["moledit"] = UnifiedStage1Dataset(
+                resolved_paths["moledit"],
+                source_name="MolEditLatent",
+                task_type="latent_world_modeling",
+                unimol_dictionary=self.unimol_dictionary,
+                encoder_types=self.encoder_types,
+                max_latent_slots=self.max_latent_slots,
+                use_task_tokens=self.use_task_tokens,
+            )
         if "downstream" in self.enabled_sources and resolved_paths["downstream"]:
             datasets["downstream"] = UnifiedStage1Dataset(
                 resolved_paths["downstream"],
@@ -238,40 +277,58 @@ class Stage1DM(LightningDataModule):
         if len(datasets) == 0:
             raise ValueError("No stage1 unified dataset path provided.")
 
-        # Optional train subset control: keep only a fraction of each source.
-        # Useful for fast ablations (e.g. 50% training data).
+        # Always split each source into train/test, and allow an additional
+        # global/per-source "total data fraction" before splitting.
         holdout_samples = []
-        if self.train_subset_fraction < 1.0 or len(self.train_subset_fraction_by_source) > 0:
+        print(
+            f"[Stage1DM] source split config: train_fraction={self.source_train_fraction}, "
+            f"total_data_fraction={self.total_data_fraction}, "
+            f"total_data_fraction_by_source={self.total_data_fraction_by_source}, seed={self.split_seed}"
+        )
+        g = torch.Generator()
+        g.manual_seed(self.split_seed)
+        reduced = {}
+        for source, ds in datasets.items():
+            n_total = len(ds)
+            total_frac = float(self.total_data_fraction_by_source.get(source, self.total_data_fraction))
+            total_frac = max(0.0, min(1.0, total_frac))
+            train_frac = max(0.0, min(1.0, float(self.source_train_fraction)))
+
+            if n_total <= 0:
+                continue
+
+            if total_frac <= 0.0:
+                selected_n = 1
+            elif total_frac >= 1.0:
+                selected_n = n_total
+            else:
+                selected_n = max(1, int(n_total * total_frac))
+            selected_n = min(selected_n, n_total)
+
+            perm = torch.randperm(n_total, generator=g).tolist()
+            selected_indices = perm[:selected_n]
+
+            if selected_n <= 1:
+                train_indices = selected_indices
+                holdout_indices = []
+            else:
+                train_n = int(selected_n * train_frac)
+                train_n = max(1, min(train_n, selected_n - 1))
+                train_indices = selected_indices[:train_n]
+                holdout_indices = selected_indices[train_n:]
+
+            reduced[source] = Subset(ds, train_indices)
             print(
-                f"[Stage1DM] applying train subset: global_fraction={self.train_subset_fraction}, "
-                f"per_source={self.train_subset_fraction_by_source}, seed={self.train_subset_seed}"
+                f"[Stage1DM] source={source}: total={n_total}, selected={selected_n}, "
+                f"train={len(train_indices)}, test={len(holdout_indices)}"
             )
-            g = torch.Generator()
-            g.manual_seed(self.train_subset_seed)
-            reduced = {}
-            for source, ds in datasets.items():
-                frac = float(self.train_subset_fraction_by_source.get(source, self.train_subset_fraction))
-                frac = max(0.0, min(1.0, frac))
-                n_total = len(ds)
-                if frac >= 1.0:
-                    reduced[source] = ds
-                    print(f"[Stage1DM] subset source={source}: keep {n_total}/{n_total} (1.0)")
-                    continue
-                if n_total <= 1 or frac <= 0.0:
-                    keep_n = 1
-                else:
-                    keep_n = max(1, int(n_total * frac))
-                perm = torch.randperm(n_total, generator=g).tolist()
-                keep_indices = perm[:keep_n]
-                holdout_indices = perm[keep_n:]
-                reduced[source] = Subset(ds, keep_indices)
-                print(f"[Stage1DM] subset source={source}: keep {keep_n}/{n_total} ({frac:.3f})")
-                if self.eval_from_train_holdout and len(holdout_indices) > 0 and hasattr(ds, "samples"):
-                    ds_samples = getattr(ds, "samples", [])
-                    for hi in holdout_indices:
-                        if 0 <= hi < len(ds_samples):
-                            holdout_samples.append(ds_samples[hi])
-            datasets = reduced
+
+            if self.eval_from_train_holdout and len(holdout_indices) > 0 and hasattr(ds, "samples"):
+                ds_samples = getattr(ds, "samples", [])
+                for hi in holdout_indices:
+                    if 0 <= hi < len(ds_samples):
+                        holdout_samples.append(ds_samples[hi])
+        datasets = reduced
 
         self._source_datasets = datasets
         self._source_names = list(datasets.keys())
@@ -301,7 +358,7 @@ class Stage1DM(LightningDataModule):
             self.val_dataset = UnifiedStage1Dataset(
                 data_paths=[],
                 source_name="Stage1HoldoutEval",
-                task_type="downstream",
+                task_type="conversation",
                 unimol_dictionary=self.unimol_dictionary,
                 encoder_types=self.encoder_types,
                 max_latent_slots=self.max_latent_slots,
@@ -309,6 +366,23 @@ class Stage1DM(LightningDataModule):
                 preloaded_samples=holdout_samples,
             )
             print(f"[Stage1DM] holdout eval size: {len(self.val_dataset)}")
+        elif len(self.eval_moledit_test_paths) > 0:
+            eval_samples = build_moledit_eval_samples_from_json(
+                self.eval_moledit_test_paths,
+                sample_per_task=self.eval_moledit_sample_per_task,
+                seed=self.eval_seed,
+            )
+            self.val_dataset = UnifiedStage1Dataset(
+                data_paths=[],
+                source_name="MolEditEval",
+                task_type="downstream",
+                unimol_dictionary=self.unimol_dictionary,
+                encoder_types=self.encoder_types,
+                max_latent_slots=self.max_latent_slots,
+                use_task_tokens=self.use_task_tokens,
+                preloaded_samples=eval_samples,
+            )
+            print(f"[Stage1DM] moledit eval size: {len(self.val_dataset)}")
         elif len(self.eval_downstream_csv_paths) > 0:
             eval_samples = build_downstream_eval_samples_from_csv(
                 self.eval_downstream_csv_paths,

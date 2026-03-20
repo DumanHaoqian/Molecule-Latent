@@ -13,6 +13,7 @@ from utils.configuration_mol_llama import MolLLaMAConfig
 
 DEFAULT_TRAIN_CONFIG = "/home/haoqian/Data/Molecule/Latent/configs/stage1/train_config.yaml"
 DEFAULT_STAGE1_CKPT_DIR = "/home/haoqian/Data/Molecule/Latent/checkpoints/stage1"
+DEFAULT_STAGE1_CKPT_PATH = "/home/haoqian/Data/Molecule/Latent/checkpoints/stage1/last-v3.ckpt"
 
 
 def _pick_checkpoint(ckpt_path: str, ckpt_dir: str) -> str:
@@ -99,7 +100,7 @@ def _decode_new_tokens(tokenizer, outputs, text_batch):
 def main():
     parser = argparse.ArgumentParser(description="Stage-I interactive chat")
     parser.add_argument("--train_config", default=DEFAULT_TRAIN_CONFIG)
-    parser.add_argument("--checkpoint_path", default="", help="Optional specific .ckpt path")
+    parser.add_argument("--checkpoint_path", default=DEFAULT_STAGE1_CKPT_PATH, help="Specific .ckpt path (default: last-v3)")
     parser.add_argument("--checkpoint_dir", default=DEFAULT_STAGE1_CKPT_DIR, help="Auto-pick latest .ckpt from this directory")
     parser.add_argument("--device", default="", help="e.g. cuda:0 or cpu")
     parser.add_argument("--precision", default="", help="Override precision (bf16-mixed/16/32)")

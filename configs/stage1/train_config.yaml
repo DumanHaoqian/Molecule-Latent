@@ -4,6 +4,14 @@ strategy_name: auto
 accelerator: gpu
 devices:
   - 0
+num_nodes: 1
+sync_batchnorm: false
+# If true (or when launched by accelerate in multi-process mode),
+# stage1.py switches to accelerate-compatible distributed settings.
+use_accelerate_launch: false
+accelerate_strategy: ddp
+accelerate_devices_per_process: 1
+accelerate_num_nodes: 1
 precision: bf16-mixed
 max_epochs: 5
 check_val_every_n_epoch: 1
@@ -61,7 +69,11 @@ stage1:
   use_task_tokens: true
   use_mixed_stage1_training: true
   eval_every_n_steps: 500
-  eval_before_training: true
+  # Save latent-token visualization every N optimizer steps.
+  latent_viz_every_n_steps: 500
+  latent_viz_max_samples: 8
+  latent_viz_out_dir: "/home/haoqian/Data/Molecule/Latent/latent_viz"
+  eval_before_training: false
   eval_before_training_use_base_forward: true
   test_results_csv_path: "/home/haoqian/Data/Molecule/Latent/test.csv"
   mw_warmup_start: 5.0

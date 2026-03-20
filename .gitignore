@@ -18,6 +18,8 @@ logs/
 playground_inputs.json
 playground_outputs.json
 
+## Visualization
+latent_vis_smoke/
 
 ## Pychache
 __pycache__/

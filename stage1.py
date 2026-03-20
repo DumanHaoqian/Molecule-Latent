@@ -32,6 +32,44 @@ def _to_plain(obj):
     return OmegaConf.to_container(obj, resolve=True) if OmegaConf.is_config(obj) else obj
 
 
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name, None)
+    if value is None:
+        return int(default)
+    try:
+        return int(value)
+    except Exception:
+        return int(default)
+
+
+def _resolve_trainer_runtime(train_config):
+    accelerator = getattr(train_config, "accelerator", "gpu")
+    devices = getattr(train_config, "devices", 1)
+    strategy = getattr(train_config, "strategy_name", "auto")
+    num_nodes = int(getattr(train_config, "num_nodes", 1))
+    sync_batchnorm = bool(getattr(train_config, "sync_batchnorm", False))
+
+    use_accelerate_launch = bool(getattr(train_config, "use_accelerate_launch", False))
+    world_size = _env_int("WORLD_SIZE", 1)
+    local_rank = _env_int("LOCAL_RANK", -1)
+    rank = _env_int("RANK", 0)
+    launched_multi_process = world_size > 1 and local_rank >= 0
+
+    if use_accelerate_launch or launched_multi_process:
+        strategy = str(getattr(train_config, "accelerate_strategy", "ddp"))
+        devices = int(getattr(train_config, "accelerate_devices_per_process", 1))
+        num_nodes = int(getattr(train_config, "accelerate_num_nodes", 1))
+        print(
+            "[Stage1] accelerate-compatible runtime: "
+            f"world_size={world_size}, rank={rank}, local_rank={local_rank}, "
+            f"strategy={strategy}, devices_per_process={devices}, num_nodes={num_nodes}"
+        )
+    else:
+        print(f"[Stage1] default runtime: strategy={strategy}, devices={devices}, num_nodes={num_nodes}")
+
+    return accelerator, devices, strategy, num_nodes, sync_batchnorm
+
+
 def _build_tokenizer(llm_model_name):
     tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
     mol_ids = tokenizer("<mol>", add_special_tokens=False).input_ids
@@ -84,17 +122,18 @@ def main():
     datamodule = Stage1DM(
         tokenizer=tokenizer,
         llama_version=llama_version,
-        num_workers=int(_cfg_get(data_cfg, "num_workers", data_config.num_workers)),
-        batch_size=int(_cfg_get(data_cfg, "batch_size", data_config.batch_size)),
+        num_workers=int(_cfg_get(data_cfg, "num_workers", 0)),
+        batch_size=int(_cfg_get(data_cfg, "batch_size", 1)),
         unimol_dictionary=unimol_dictionary,
         encoder_types=model_config.graph_encoder_config.encoder_types,
-        text_max_len=int(_cfg_get(data_cfg, "text_max_len", data_config.text_max_len)),
+        text_max_len=int(_cfg_get(data_cfg, "text_max_len", 512)),
         max_latent_slots=int(_cfg_get(stage1_cfg, "max_latent_slots", getattr(train_config, "max_latent_slots", 6))),
         latent_slot_text_max_len=int(getattr(train_config, "latent_slot_text_max_len", 48)),
         stage1_mixed_training=bool(_cfg_get(stage1_cfg, "use_mixed_stage1_training", getattr(train_config, "stage1_mixed_training", True))),
-        latent_world_modeling_path=str(_cfg_get(data_cfg, "latent_path", getattr(data_config, "latent_world_modeling_path", ""))),
-        conversation_sft_path=str(_cfg_get(data_cfg, "conversation_path", getattr(data_config, "conversation_sft_path", ""))),
-        downstream_tasks_paths=downstream_paths or [str(getattr(data_config, "downstream_tasks_path", ""))],
+        latent_world_modeling_path=str(_cfg_get(data_cfg, "latent_path", "")),
+        conversation_sft_path=str(_cfg_get(data_cfg, "conversation_path", "")),
+        moledit_path=str(_cfg_get(data_cfg, "moledit_path", "")),
+        downstream_tasks_paths=downstream_paths,
         fallback_raw_paths=_to_plain(_cfg_get(data_cfg, "fallback_raw_paths", {})),
         source_sampling_weights=_to_plain(_cfg_get(data_cfg, "source_sampling_weights", getattr(train_config, "source_sampling_weights", {}))),
         use_task_tokens=bool(_cfg_get(stage1_cfg, "use_task_tokens", getattr(train_config, "use_task_tokens", True))),
@@ -110,8 +149,16 @@ def main():
         eval_moleculeqa_sample_size=int(_cfg_get(data_cfg, "eval_moleculeqa_sample_size", 1000)),
         eval_pampa_path=str(_cfg_get(data_cfg, "eval_pampa_path", "")),
         eval_pampa_sample_size=int(_cfg_get(data_cfg, "eval_pampa_sample_size", 1000)),
+        eval_moledit_test_paths=list(_cfg_get(data_cfg, "eval_moledit_test_paths", [])),
+        eval_moledit_sample_per_task=int(_cfg_get(data_cfg, "eval_moledit_sample_per_task", 0)),
         enabled_sources=list(_cfg_get(data_cfg, "enabled_sources", ["pubchem", "conversation"])),
         eval_from_train_holdout=bool(_cfg_get(data_cfg, "eval_from_train_holdout", False)),
+        source_train_fraction=float(_cfg_get(data_cfg, "source_train_fraction", 0.8)),
+        total_data_fraction=float(_cfg_get(data_cfg, "total_data_fraction", _cfg_get(data_cfg, "train_subset_fraction", 1.0))),
+        total_data_fraction_by_source=_to_plain(
+            _cfg_get(data_cfg, "total_data_fraction_by_source", _cfg_get(data_cfg, "train_subset_fraction_by_source", {}))
+        ),
+        split_seed=int(_cfg_get(data_cfg, "split_seed", _cfg_get(data_cfg, "train_subset_seed", 42))),
         train_subset_fraction=float(_cfg_get(data_cfg, "train_subset_fraction", 1.0)),
         train_subset_fraction_by_source=_to_plain(_cfg_get(data_cfg, "train_subset_fraction_by_source", {})),
         train_subset_seed=int(_cfg_get(data_cfg, "train_subset_seed", 42)),
@@ -150,14 +197,27 @@ def main():
         loggers.append(wandb_logger)
         print(f"W&B logger enabled (project=mol-modeling-stageI, mode={wandb_mode}).")
 
+    trainer_accelerator, trainer_devices, trainer_strategy, trainer_num_nodes, trainer_sync_bn = _resolve_trainer_runtime(
+        train_config
+    )
+    val_interval_cfg = _cfg_get(stage1_cfg, "eval_every_n_steps", 200)
+    try:
+        val_check_interval = float(val_interval_cfg)
+    except (TypeError, ValueError):
+        val_check_interval = 200.0
+    if val_check_interval > 1:
+        val_check_interval = int(val_check_interval)
+
     trainer = pl.Trainer(
-        accelerator=train_config.accelerator,
-        devices=train_config.devices,
-        strategy=train_config.strategy_name,
+        accelerator=trainer_accelerator,
+        devices=trainer_devices,
+        strategy=trainer_strategy,
+        num_nodes=trainer_num_nodes,
+        sync_batchnorm=trainer_sync_bn,
         precision=train_config.precision,
         max_epochs=int(train_config.max_epochs),
         check_val_every_n_epoch=int(train_config.check_val_every_n_epoch),
-        val_check_interval=int(_cfg_get(stage1_cfg, "eval_every_n_steps", 200)),
+        val_check_interval=val_check_interval,
         accumulate_grad_batches=int(train_config.accumulate_grad_batches),
         callbacks=[best_ckpt_cb, lr_cb],
         logger=loggers,
