@@ -19,7 +19,11 @@ playground_inputs.json
 playground_outputs.json
 
 ## Visualization
-latent_vis_smoke/
+latent_vis/
 
 ## Pychache
 __pycache__/
+
+
+## TestResult
+test.csv

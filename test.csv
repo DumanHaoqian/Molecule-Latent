@@ -1,2 +1,0 @@
-global_step,epoch,val_loss,val_score,val_loss_PubChemLatent,val_score_PubChemLatent,val_loss_ComprehensiveConversation,val_score_ComprehensiveConversation
-0,0,1.2031570672988892,-1.2031570672988892,1.4100449085235596,-1.4100449085235596,0.8563328385353088,-0.8563328385353088

@@ -165,14 +165,29 @@ def main():
         seed=int(getattr(train_config, "seed", 42)),
     )
 
-    best_ckpt_cb = ModelCheckpoint(
-        dirpath=os.path.join("checkpoints", "stage1"),
-        filename="best-step{step:08d}-score{val_score:.4f}",
-        monitor="val/score",
-        mode="max",
-        save_top_k=1,
-        save_last=True,
-    )
+    has_eval_data = bool(_cfg_get(data_cfg, "eval_from_train_holdout", False))
+    has_eval_data = has_eval_data or len(list(_cfg_get(data_cfg, "eval_moledit_test_paths", []))) > 0
+    has_eval_data = has_eval_data or len(list(_cfg_get(data_cfg, "eval_downstream_csv_paths", []))) > 0
+    has_eval_data = has_eval_data or len(str(_cfg_get(data_cfg, "eval_moleculeqa_test_path", "")).strip()) > 0
+    has_eval_data = has_eval_data or len(str(_cfg_get(data_cfg, "eval_pampa_path", "")).strip()) > 0
+
+    if has_eval_data:
+        best_ckpt_cb = ModelCheckpoint(
+            dirpath=os.path.join("checkpoints", "stage1"),
+            filename="best-step{step:08d}-score{val_score:.4f}",
+            monitor="val/score",
+            mode="max",
+            save_top_k=1,
+            save_last=True,
+        )
+    else:
+        print("[Stage1] no validation/test dataloader configured; disable val loop and monitor-less checkpointing.")
+        best_ckpt_cb = ModelCheckpoint(
+            dirpath=os.path.join("checkpoints", "stage1"),
+            filename="epoch{epoch:02d}-step{step:08d}",
+            save_top_k=0,
+            save_last=True,
+        )
     lr_cb = LearningRateMonitor(logging_interval="step")
     csv_logger = CSVLogger(save_dir="lightning_logs", name="stage1")
     loggers = [csv_logger]
@@ -218,13 +233,15 @@ def main():
         max_epochs=int(train_config.max_epochs),
         check_val_every_n_epoch=int(train_config.check_val_every_n_epoch),
         val_check_interval=val_check_interval,
+        limit_val_batches=0.0 if not has_eval_data else 1.0,
+        num_sanity_val_steps=0 if not has_eval_data else 2,
         accumulate_grad_batches=int(train_config.accumulate_grad_batches),
         callbacks=[best_ckpt_cb, lr_cb],
         logger=loggers,
         default_root_dir=".",
         log_every_n_steps=1,
     )
-    if bool(_cfg_get(stage1_cfg, "eval_before_training", True)):
+    if has_eval_data and bool(_cfg_get(stage1_cfg, "eval_before_training", True)):
         print("[Stage1] running pre-finetuning validation at global_step=0 ...")
         model.use_base_forward_for_validation = bool(_cfg_get(stage1_cfg, "eval_before_training_use_base_forward", True))
         trainer.validate(model=model, datamodule=datamodule, verbose=True)

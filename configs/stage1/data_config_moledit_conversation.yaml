@@ -8,12 +8,10 @@ data:
   moledit_path: "/home/haoqian/Data/Molecule/Datasets/Train/03MolEdit/mol_edit_with_worldmodel.jsonl"
 
   source_sampling_weights:
-    pubchem: 0.4
     conversation: 0.3
-    moledit: 0.3
+    moledit: 0.7
 
   enabled_sources:
-    - pubchem
     - conversation
     - moledit
 

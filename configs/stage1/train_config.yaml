@@ -68,7 +68,7 @@ stage1:
   max_latent_slots: 6
   use_task_tokens: true
   use_mixed_stage1_training: true
-  eval_every_n_steps: 500
+  eval_every_n_steps: 0.5
   # Save latent-token visualization every N optimizer steps.
   latent_viz_every_n_steps: 500
   latent_viz_max_samples: 8
@@ -104,5 +104,5 @@ stage1:
 
 use_wandb: True
 wandb_mode: online
-wandb_project: latent-wm-v2
-wandb_run_name: stage1-pubchem-conv-lm-latent-20260320
+wandb_project: latent-wm-v3
+wandb_run_name: moledit_only-latent-20260321
