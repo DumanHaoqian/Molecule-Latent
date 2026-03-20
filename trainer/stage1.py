@@ -48,13 +48,10 @@ class Stage1Trainer(pl.LightningModule):
             stage1_wm_cls_keys=list(getattr(stage1_cfg, "classification_targets", getattr(train_config, "wm_classification_targets", []))),
         )
         self.lambda_latent = float(getattr(train_config, "loss_weights", {}).get("latent", 1.0))
-        self.lambda_wm = float(getattr(train_config, "loss_weights", {}).get("wm", 1.0))
         self.lambda_lm = float(getattr(train_config, "loss_weights", {}).get("lm", 0.1))
-        self.lambda_conv_lm = float(getattr(train_config, "loss_weights", {}).get("conv_lm", 1.0))
-        self.lambda_down_lm = float(getattr(train_config, "loss_weights", {}).get("downstream_lm", 1.0))
         self.source_counter = defaultdict(int)
-        self.task_to_id = {"latent_world_modeling": 0, "conversation": 1, "downstream": 2}
-        self.source_to_id = {"PubChemLatent": 0, "ComprehensiveConversation": 1, "DownstreamTasks": 2}
+        self.task_to_id = {"latent_world_modeling": 0, "conversation": 1}
+        self.source_to_id = {"PubChemLatent": 0, "ComprehensiveConversation": 1}
         self.stage1_cfg = getattr(train_config, "stage1", {})
         self.test_results_csv_path = str(
             getattr(
@@ -299,6 +296,10 @@ class Stage1Trainer(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         task_type = batch["task_type"]
+        if task_type not in {"latent_world_modeling", "conversation"}:
+            raise ValueError(
+                f"Stage-I training only supports pubchem/conversation tasks, got task_type={task_type}"
+            )
         source_name = batch["source_dataset"][0] if len(batch["source_dataset"]) > 0 else "unknown"
         self.source_counter[source_name] += 1
         if self.scheduler:
@@ -307,23 +308,12 @@ class Stage1Trainer(pl.LightningModule):
         outputs = self.mol_llama.forward_stage1(batch)
 
         lm_loss = outputs["lm_loss"] if outputs["lm_loss"] is not None else torch.tensor(0.0, device=self.device)
-        latent_loss = torch.tensor(0.0, device=self.device)
-        wm_loss = torch.tensor(0.0, device=self.device)
-
-        if task_type == "latent_world_modeling":
-            latent_loss = self._compute_latent_loss(
-                outputs["latent_states"],
-                outputs["slot_targets"],
-                batch["latent_slot_mask"].to(outputs["latent_states"].device),
-            )
-            wm_loss = self._compute_wm_loss(outputs, batch)
-            loss = self.lambda_latent * latent_loss + self.lambda_wm * wm_loss + self.lambda_lm * lm_loss
-        elif task_type == "conversation":
-            loss = self.lambda_conv_lm * lm_loss
-        elif task_type == "downstream":
-            loss = self.lambda_down_lm * lm_loss
-        else:
-            raise ValueError(f"Unknown task_type: {task_type}")
+        latent_loss = self._compute_latent_loss(
+            outputs["latent_states"],
+            outputs["slot_targets"],
+            batch["latent_slot_mask"].to(outputs["latent_states"].device),
+        )
+        loss = self.lambda_lm * lm_loss + self.lambda_latent * latent_loss
 
         valid_slot_mean = float(batch["latent_slot_mask"].float().sum(dim=1).mean().item())
         prop_cnt = batch["property_regression_mask"].float().sum(dim=1) + batch["property_classification_mask"].float().sum(dim=1)
@@ -332,12 +322,10 @@ class Stage1Trainer(pl.LightningModule):
         self.log("train/loss_total", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
         self.log("train/loss_lm", lm_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
         self.log("train/loss_latent", latent_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
-        self.log("train/loss_wm", wm_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
         # Task-classified losses for W&B grouping.
         self.log(f"train/{task_type}/loss_total", loss, on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
         self.log(f"train/{task_type}/loss_lm", lm_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
         self.log(f"train/{task_type}/loss_latent", latent_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
-        self.log(f"train/{task_type}/loss_wm", wm_loss, on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
         self.log("train/task_type_id", float(self.task_to_id.get(task_type, -1)), on_step=True, on_epoch=False, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
         self.log("train/source_name_id", float(self.source_to_id.get(source_name, -1)), on_step=True, on_epoch=False, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
         self.log(f"train/task_type/{task_type}", 1.0, on_step=True, on_epoch=False, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
@@ -350,7 +338,7 @@ class Stage1Trainer(pl.LightningModule):
             print(
                 f"[Stage1] step={self.global_step} task={task_type} source={source_name} "
                 f"loss={float(loss):.4f} lm={float(lm_loss):.4f} "
-                f"latent={float(latent_loss):.4f} wm={float(wm_loss):.4f} "
+                f"latent={float(latent_loss):.4f} "
                 f"slot_mean={valid_slot_mean:.2f} prop_mean={valid_prop_mean:.2f}"
             )
         return loss

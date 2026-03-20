@@ -93,4 +93,4 @@ stage1:
 use_wandb: True
 wandb_mode: online
 wandb_project: latent-wm-v2
-wandb_run_name: latent-wm-v2
+wandb_run_name: stage1-pubchem-conv-lm-latent-20260320

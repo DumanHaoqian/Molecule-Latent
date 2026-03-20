@@ -133,7 +133,11 @@ class Stage1DM(LightningDataModule):
         self.eval_moleculeqa_sample_size = int(eval_moleculeqa_sample_size)
         self.eval_pampa_path = eval_pampa_path
         self.eval_pampa_sample_size = int(eval_pampa_sample_size)
-        self.enabled_sources = list(enabled_sources or ["pubchem", "conversation", "downstream"])
+        requested_sources = list(enabled_sources or ["pubchem", "conversation"])
+        # Stage-I training scope is restricted to pubchem + conversation.
+        self.enabled_sources = [s for s in requested_sources if s in {"pubchem", "conversation"}]
+        if len(self.enabled_sources) == 0:
+            self.enabled_sources = ["pubchem", "conversation"]
         self.eval_from_train_holdout = bool(eval_from_train_holdout)
         self.train_subset_fraction = float(train_subset_fraction)
         self.train_subset_fraction_by_source = dict(train_subset_fraction_by_source or {})
@@ -147,10 +151,9 @@ class Stage1DM(LightningDataModule):
         self.fallback_raw_paths = fallback_raw_paths or {}
         self.source_sampling_weights = source_sampling_weights or {
             "pubchem": 0.8,
-            "conversation": 0.1,
-            "downstream": 0.1,
+            "conversation": 0.2,
         }
-        self.source_sample_counter = {"pubchem": 0, "conversation": 0, "downstream": 0}
+        self.source_sample_counter = {"pubchem": 0, "conversation": 0}
 
         self.train_dataset = None
         self.train_batch_sampler = None

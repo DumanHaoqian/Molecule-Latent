@@ -14,8 +14,7 @@ data:
 
   latent_path: "/home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/latent_world_modeling.jsonl"
   conversation_path: "/home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/conversation_sft.jsonl"
-  downstream_paths:
-    - "/home/haoqian/Data/Molecule/Construction/Datasets/unified_v1/downstream_tasks.jsonl"
+  downstream_paths: []
 
   fallback_raw_paths:
     latent_path: "/home/haoqian/Data/Molecule/Construction/Datasets/SFT/pubchem_17k.jsonl"
