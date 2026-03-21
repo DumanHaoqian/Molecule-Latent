@@ -139,7 +139,7 @@ def main():
         unimol_dictionary=unimol_dictionary,
         encoder_types=model_config.graph_encoder_config.encoder_types,
         text_max_len=int(_cfg_get(data_cfg, "text_max_len", 512)),
-        max_latent_slots=int(_cfg_get(stage1_cfg, "max_latent_slots", getattr(train_config, "max_latent_slots", 6))),
+        max_latent_slots=int(_cfg_get(stage1_cfg, "max_latent_slots", getattr(train_config, "max_latent_slots", 4))),
         latent_slot_text_max_len=int(getattr(train_config, "latent_slot_text_max_len", 48)),
         stage1_mixed_training=bool(_cfg_get(stage1_cfg, "use_mixed_stage1_training", getattr(train_config, "stage1_mixed_training", True))),
         latent_world_modeling_path=str(_cfg_get(data_cfg, "latent_path", "")),

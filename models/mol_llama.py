@@ -69,7 +69,7 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
         lambda_latent=1.0,
         lambda_lm=1.0,
         lambda_cls=0.5,
-        stage1_max_latent_slots=6,
+        stage1_max_latent_slots=4,
         stage1_wm_reg_keys=None,
         stage1_wm_cls_keys=None,
     ):
@@ -124,8 +124,7 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
         self.latent_cls_head = nn.Linear(self.llm.config.hidden_size, 2)
 
         # Stage-I unified training heads (lightweight and optional).
-        # stage1_max_latent_slots means max number of subgraph-aligned latent slots.
-        # Stage-I latent reasoning uses 1 extra global latent token.
+        # stage1_max_latent_slots = K rollout steps; each step is a slot-supervised latent (no separate global token).
         self.stage1_max_latent_slots = int(stage1_max_latent_slots)
         self.stage1_slot_queries = nn.Parameter(
             torch.randn(1, self.stage1_max_latent_slots, self.llm.config.hidden_size) * 0.02
@@ -391,30 +390,29 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
             use_cache=False,
         )
 
-        # Stage-I latent reasoning rollout:
-        # hidden -> latent token embedding -> feed back as next token embedding for K steps.
-        # K = 1 (global latent token) + max_subgraph_slots.
+        # Stage-I latent rollout: K steps = max_subgraph_slots, one latent token per supervised slot (no global token).
         max_subgraph_slots = batch["latent_slot_input_ids"].shape[1]
-        total_latent_steps = 1 + max_subgraph_slots
         latent_tokens_all = []
         for bi in range(inputs_embeds.shape[0]):
             prefix_embeds = self._extract_valid_prefix_embeds(inputs_embeds[bi], text_batch.attention_mask[bi])
-            # [K_total, H], first token is global latent token.
-            latent_seq = self._rollout_latent_tokens(prefix_embeds, num_steps=total_latent_steps)
+            latent_seq = self._rollout_latent_tokens(prefix_embeds, num_steps=max_subgraph_slots)
             latent_tokens_all.append(latent_seq)
-        latent_tokens_all = torch.stack(latent_tokens_all, dim=0)  # [B, K_total, H]
-        global_latent_state = latent_tokens_all[:, 0, :]  # [B, H]
-        latent_states = latent_tokens_all[:, 1:, :]       # [B, K_subgraph, H]
-        latent_states = self.stage1_hidden_to_latent(latent_states)
+        latent_tokens_all = torch.stack(latent_tokens_all, dim=0)  # [B, K, H]
+        latent_states = self.stage1_hidden_to_latent(latent_tokens_all)
 
-        # World modeling uses the global latent token.
-        wm_preds = self.stage1_wm_head(global_latent_state)
+        model_device = next(self.parameters()).device
+        slot_mask_batch = batch["latent_slot_mask"].to(model_device)  # [B, K]
+
+        # WM head: pooled slot latents (masked mean over valid slots).
+        mask_f = slot_mask_batch.to(dtype=latent_states.dtype).unsqueeze(-1)
+        slot_sum = (latent_states * mask_f).sum(dim=1)
+        denom = mask_f.sum(dim=1).clamp(min=1.0)
+        wm_pool = slot_sum / denom
+        wm_preds = self.stage1_wm_head(wm_pool)
 
         # Slot target embedding:
         # Prefer graph-based subgraph feature encoding from slot smiles (closer to
         # "latent token <-> subgraph feature" objective), fallback to descriptor text.
-        model_device = next(self.parameters()).device
-        slot_mask_batch = batch["latent_slot_mask"].to(model_device)  # [B, K]
         slot_smiles_2d = batch.get("latent_slot_smiles", None)
         bsz, ksz = slot_mask_batch.shape
         slot_targets = torch.zeros(
@@ -464,7 +462,8 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
         return {
             "logits": llm_out.logits,
             "lm_loss": llm_out.loss,
-            "global_latent_state": global_latent_state,
+            # Pooled slot latents (for WM / legacy callers); not a separate global rollout token.
+            "global_latent_state": wm_pool,
             "latent_states_all": latent_tokens_all,
             "latent_states": latent_states,
             "slot_targets": slot_targets,
@@ -507,7 +506,7 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
             "logits": llm_out.logits,
             "lm_loss": llm_out.loss,
             "global_latent_state": torch.zeros((bsz, self.llm.config.hidden_size), device=inputs_embeds.device, dtype=inputs_embeds.dtype),
-            "latent_states_all": torch.zeros((bsz, ksz + 1, self.llm.config.hidden_size), device=inputs_embeds.device, dtype=inputs_embeds.dtype),
+            "latent_states_all": torch.zeros((bsz, ksz, self.llm.config.hidden_size), device=inputs_embeds.device, dtype=inputs_embeds.dtype),
             "latent_states": zero_latent,
             "slot_targets": zero_latent,
             "wm_preds": wm_preds,

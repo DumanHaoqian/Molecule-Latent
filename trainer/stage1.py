@@ -44,7 +44,7 @@ class Stage1Trainer(pl.LightningModule):
             torch_dtype=torch_dtype,
             enable_flash=getattr(train_config, "enable_flash", False),
             use_latent_reasoning=False,
-            stage1_max_latent_slots=int(getattr(stage1_cfg, "max_latent_slots", getattr(train_config, "max_latent_slots", 6))),
+            stage1_max_latent_slots=int(getattr(stage1_cfg, "max_latent_slots", getattr(train_config, "max_latent_slots", 4))),
             stage1_wm_reg_keys=list(getattr(stage1_cfg, "regression_targets", getattr(train_config, "wm_regression_targets", []))),
             stage1_wm_cls_keys=list(getattr(stage1_cfg, "classification_targets", getattr(train_config, "wm_classification_targets", []))),
         )

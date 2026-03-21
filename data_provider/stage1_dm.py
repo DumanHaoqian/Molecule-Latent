@@ -79,7 +79,7 @@ class Stage1DM(LightningDataModule):
         unimol_dictionary=None,
         encoder_types=None,
         text_max_len: int = 512,
-        max_latent_slots: int = 6,
+        max_latent_slots: int = 4,
         latent_slot_text_max_len: int = 48,
         stage1_mixed_training: bool = True,
         latent_world_modeling_path: str = "",

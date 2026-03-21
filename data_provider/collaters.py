@@ -34,7 +34,7 @@ class Stage1UnifiedCollater:
         llama_version,
         pad_idx,
         encoder_types,
-        max_latent_slots=6,
+        max_latent_slots=4,
         latent_slot_text_max_len=48,
         text_max_len=512,
         regression_targets=None,

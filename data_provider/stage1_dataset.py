@@ -67,7 +67,7 @@ class UnifiedStage1Dataset(Dataset):
         task_type,
         unimol_dictionary,
         encoder_types,
-        max_latent_slots=6,
+        max_latent_slots=4,
         max_atoms=512,
         use_task_tokens=True,
         preloaded_samples=None,
