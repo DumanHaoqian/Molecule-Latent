@@ -1,3 +1,0 @@
-global_step,sample_index,sample_id,source_dataset,task_type,num_valid_slots,diag_cos_mean,diag_cos_min,diag_cos_max,all_cos_mean
-0,0,ccd74b09-cfec-4b55-ba5d-56089286ca70,ChemCotMolEdit,latent_world_modeling,6,-0.01788295991718769,-0.031176883727312088,-0.0031158076599240303,-0.018035775050520897
-0,1,e78c0820-6611-4ff3-bb8f-76551e135b09,ChemCotMolEdit,latent_world_modeling,6,0.0028397266287356615,-0.009172189980745316,0.013959969393908978,0.002877378137782216
