@@ -19,7 +19,7 @@ playground_inputs.json
 playground_outputs.json
 
 ## Visualization
-latent_vis/
+latent_viz/
 
 ## Pychache
 __pycache__/
