@@ -27,3 +27,4 @@ __pycache__/
 
 ## TestResult
 test.csv
+eval_outputs/

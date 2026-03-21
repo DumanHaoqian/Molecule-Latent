@@ -1,5 +1,7 @@
 import os
 import argparse
+import re
+from datetime import datetime
 
 import pytorch_lightning as pl
 from omegaconf import OmegaConf
@@ -80,6 +82,16 @@ def _build_tokenizer(llm_model_name):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     return tokenizer
+
+
+def _sanitize_name(name: str, max_len: int = 64) -> str:
+    s = re.sub(r"[^A-Za-z0-9._-]+", "-", str(name or "").strip())
+    s = s.strip("-.")
+    if len(s) == 0:
+        s = "stage1"
+    if len(s) > max_len:
+        s = s[:max_len]
+    return s
 
 
 def main():
@@ -171,36 +183,28 @@ def main():
     has_eval_data = has_eval_data or len(str(_cfg_get(data_cfg, "eval_moleculeqa_test_path", "")).strip()) > 0
     has_eval_data = has_eval_data or len(str(_cfg_get(data_cfg, "eval_pampa_path", "")).strip()) > 0
 
-    if has_eval_data:
-        best_ckpt_cb = ModelCheckpoint(
-            dirpath=os.path.join("checkpoints", "stage1"),
-            filename="best-step{step:08d}-score{val_score:.4f}",
-            monitor="val/score",
-            mode="max",
-            save_top_k=1,
-            save_last=True,
-        )
-    else:
-        print("[Stage1] no validation/test dataloader configured; disable val loop and monitor-less checkpointing.")
-        best_ckpt_cb = ModelCheckpoint(
-            dirpath=os.path.join("checkpoints", "stage1"),
-            filename="epoch{epoch:02d}-step{step:08d}",
-            save_top_k=0,
-            save_last=True,
-        )
     lr_cb = LearningRateMonitor(logging_interval="step")
     csv_logger = CSVLogger(save_dir="lightning_logs", name="stage1")
     loggers = [csv_logger]
+    run_name_raw = str(getattr(train_config, "wandb_run_name", "stage1-unified-mix"))
+    run_name_tag = _sanitize_name(run_name_raw, max_len=48)
+    run_id_tag = ""
     if bool(getattr(train_config, "use_wandb", True)):
         wandb_mode = str(getattr(train_config, "wandb_mode", "online"))
         os.environ.setdefault("WANDB_MODE", wandb_mode)
         os.environ.setdefault("WANDB_DIR", os.path.abspath("wandb"))
         wandb_logger = WandbLogger(
             project=str(getattr(train_config, "wandb_project", "mol-modeling-stageI")),
-            name=str(getattr(train_config, "wandb_run_name", "stage1-unified-mix")),
+            name=run_name_raw,
             save_dir=os.path.abspath("wandb"),
             log_model=False,
         )
+        try:
+            run_id = str(getattr(wandb_logger.experiment, "id", "") or "").strip()
+            if len(run_id) > 0:
+                run_id_tag = _sanitize_name(run_id, max_len=12)
+        except Exception:
+            run_id_tag = ""
         wandb_logger.log_hyperparams(
             {
                 "train_config": OmegaConf.to_container(train_config, resolve=True),
@@ -211,6 +215,32 @@ def main():
         )
         loggers.append(wandb_logger)
         print(f"W&B logger enabled (project=mol-modeling-stageI, mode={wandb_mode}).")
+
+    run_time_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dir_tag_parts = [run_time_tag, run_name_tag]
+    if len(run_id_tag) > 0:
+        dir_tag_parts.append(run_id_tag)
+    ckpt_subdir = "-".join(dir_tag_parts)
+    ckpt_dir = os.path.join("checkpoints", "stage1", ckpt_subdir)
+    print(f"[Stage1] checkpoint dir: {ckpt_dir}")
+
+    if has_eval_data:
+        best_ckpt_cb = ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename=f"{run_name_tag}-step{{step:08d}}",
+            monitor="val/score",
+            mode="max",
+            save_top_k=1,
+            save_last=True,
+        )
+    else:
+        print("[Stage1] no validation/test dataloader configured; disable val loop and monitor-less checkpointing.")
+        best_ckpt_cb = ModelCheckpoint(
+            dirpath=ckpt_dir,
+            filename=f"{run_name_tag}-step{{step:08d}}",
+            save_top_k=0,
+            save_last=True,
+        )
 
     trainer_accelerator, trainer_devices, trainer_strategy, trainer_num_nodes, trainer_sync_bn = _resolve_trainer_runtime(
         train_config
