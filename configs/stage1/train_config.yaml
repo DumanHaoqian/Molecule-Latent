@@ -45,10 +45,7 @@ source_sampling_weights:
 
 loss_weights:
   latent: 1.0
-  wm: 0.0
   lm: 1
-  conv_lm: 1.0
-  downstream_lm: 1.0
 
 wm_regression_targets:
   - molecular_weight

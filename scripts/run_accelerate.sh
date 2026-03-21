@@ -17,10 +17,10 @@ nohup env CUDA_VISIBLE_DEVICES="${GPU_IDS}" accelerate launch \
   --num_processes "${NUM_PROCESSES}" \
   --main_process_port "${MAIN_PROCESS_PORT}" \
   --mixed_precision "${MIXED_PRECISION}" \
-  stage1.py \
-  --train_config configs/stage1/train_config.yaml \
-  --data_config configs/stage1/data_config.yaml \
-> logs/stage1_accelerate.log 2>&1 &
+  /home/haoqian/Data/Molecule/Latent/stage1.py \
+  --train_config /home/haoqian/Data/Molecule/Latent/configs/stage1/train_config.yaml \
+  --data_config /home/haoqian/Data/Molecule/Latent/configs/stage1/data_config.yaml \
+> /home/haoqian/Data/Molecule/Latent/logs/stage1_accelerate.log 2>&1 &
 
 echo "Started Stage1 training with accelerate."
 echo "Log: /home/haoqian/Data/Molecule/Latent/logs/stage1_accelerate.log"

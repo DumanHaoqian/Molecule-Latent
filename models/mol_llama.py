@@ -390,14 +390,36 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
             use_cache=False,
         )
 
-        # Stage-I latent rollout: K steps = max_subgraph_slots, one latent token per supervised slot (no global token).
+        # Stage-I latent rollout: K steps = max_subgraph_slots, one latent token per supervised slot.
+        # For LM loss, run teacher-forcing on [prefix, latent_tokens, suffix] and only
+        # supervise suffix labels to avoid train/infer mismatch.
         max_subgraph_slots = batch["latent_slot_input_ids"].shape[1]
         latent_tokens_all = []
+        lm_losses = []
         for bi in range(inputs_embeds.shape[0]):
-            prefix_embeds = self._extract_valid_prefix_embeds(inputs_embeds[bi], text_batch.attention_mask[bi])
+            prefix_embeds, suffix_embeds, suffix_labels = self._sample_segments(
+                inputs_embeds[bi], text_batch.labels[bi], text_batch.attention_mask[bi]
+            )
             latent_seq = self._rollout_latent_tokens(prefix_embeds, num_steps=max_subgraph_slots)
             latent_tokens_all.append(latent_seq)
+
+            merged_embeds = torch.cat([prefix_embeds, latent_seq, suffix_embeds], dim=0)
+            merged_attention = torch.ones((1, merged_embeds.shape[0]), device=merged_embeds.device, dtype=torch.long)
+            latent_label_pad = torch.full(
+                (prefix_embeds.shape[0] + max_subgraph_slots,), -100, device=merged_embeds.device, dtype=torch.long
+            )
+            merged_labels = torch.cat([latent_label_pad, suffix_labels], dim=0)
+            if bool((merged_labels != -100).any().item()):
+                merged_out = self.llm(
+                    inputs_embeds=merged_embeds.unsqueeze(0),
+                    attention_mask=merged_attention,
+                    labels=merged_labels.unsqueeze(0),
+                    return_dict=True,
+                    use_cache=False,
+                )
+                lm_losses.append(merged_out.loss)
         latent_tokens_all = torch.stack(latent_tokens_all, dim=0)  # [B, K, H]
+        lm_loss = torch.stack(lm_losses).mean() if len(lm_losses) > 0 else torch.tensor(0.0, device=inputs_embeds.device)
         latent_states = self.stage1_hidden_to_latent(latent_tokens_all)
 
         model_device = next(self.parameters()).device
@@ -461,7 +483,7 @@ class MolLLaMA(MolLLaMAPreTrainedModel):
 
         return {
             "logits": llm_out.logits,
-            "lm_loss": llm_out.loss,
+            "lm_loss": lm_loss,
             # Pooled slot latents (for WM / legacy callers); not a separate global rollout token.
             "global_latent_state": wm_pool,
             "latent_states_all": latent_tokens_all,

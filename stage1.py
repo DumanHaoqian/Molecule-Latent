@@ -98,9 +98,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_config", default=os.path.join("configs", "stage1", "train_config.yaml"))
     parser.add_argument("--data_config", default=os.path.join("configs", "stage1", "data_config.yaml"))
+    parser.add_argument("--run_name", default="", help="Optional run name override for W&B and checkpoint naming.")
     args = parser.parse_args()
 
     train_config, data_config = _load_configs(args.train_config, args.data_config)
+    run_name_override = str(args.run_name or "").strip()
+    if len(run_name_override) > 0:
+        train_config.wandb_run_name = run_name_override
+        print(f"[Stage1] run name override: {run_name_override}")
     pl.seed_everything(int(getattr(train_config, "seed", 42)), workers=True)
 
     model_cfg = _cfg_get(train_config, "model", {})
