@@ -634,7 +634,6 @@ class Stage1Trainer(pl.LightningModule):
         else:
             outputs = self.mol_llama.forward_stage1(batch)
         lm_loss = outputs["lm_loss"] if outputs["lm_loss"] is not None else torch.tensor(0.0, device=self.device)
-        score = -lm_loss
         batch_size = batch["input_ids"].size(0)
         source_name = batch["source_dataset"][0] if len(batch["source_dataset"]) > 0 else "unknown"
         logits = outputs["logits"]
@@ -727,11 +726,9 @@ class Stage1Trainer(pl.LightningModule):
                 self._val_metric_buckets[ds]["moledit_exact"] += int(is_exact)
                 self._val_metric_buckets[ds]["moledit_correct"] += int(is_correct)
 
-        self.log("val/loss", lm_loss, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
-        self.log("val/score", score, on_step=False, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
+        self.log("val/loss", lm_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
         self.log(f"val/loss_{source_name}", lm_loss, on_step=False, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
-        self.log(f"val/score_{source_name}", score, on_step=False, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
-        return {"val_loss": lm_loss.detach(), "val_score": score.detach()}
+        return {"val_loss": lm_loss.detach()}
 
     def on_validation_epoch_start(self):
         self.val_pos_token_id = None
@@ -743,116 +740,52 @@ class Stage1Trainer(pl.LightningModule):
             return
         if not self.trainer.is_global_zero:
             return
-
-        metrics = self.trainer.callback_metrics
-
-        def _to_float(key, default=0.0):
-            v = metrics.get(key, default)
-            if hasattr(v, "detach"):
-                v = v.detach()
-            if hasattr(v, "item"):
-                v = v.item()
-            try:
-                return float(v)
-            except (TypeError, ValueError):
-                return float(default)
-
         row = {
             "global_step": int(self.global_step),
             "epoch": int(self.current_epoch),
-            "val_loss": _to_float("val/loss", 0.0),
-            "val_score": _to_float("val/score", 0.0),
         }
-        # Aggregate metrics by task family.
-        all_bin_y, all_bin_p, all_bin_s = [], [], []
-        all_mcq_y, all_mcq_p = [], []
-        all_reg_y, all_reg_p = [], []
         all_me_total, all_me_valid, all_me_exact, all_me_correct = 0, 0, 0, 0
         for ds, bucket in self._val_metric_buckets.items():
-            by, bp, bs = bucket["binary_y"], bucket["binary_pred"], bucket["binary_score"]
-            my, mp = bucket["mcq_y"], bucket["mcq_pred"]
-            ry, rp = bucket["reg_y"], bucket["reg_pred"]
-            if len(by) > 0:
-                acc = float(sum(int(a == b) for a, b in zip(bp, by)) / len(by))
-                auc = self._binary_auc(by, bs)
-                self.log(f"val/acc_{ds}", acc, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-                row[f"val_acc_{ds}"] = acc
-                if auc is not None:
-                    self.log(f"val/auc_{ds}", auc, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-                    row[f"val_auc_{ds}"] = auc
-                all_bin_y.extend(by); all_bin_p.extend(bp); all_bin_s.extend(bs)
-            if len(my) > 0:
-                acc_mcq = float(sum(int(a == b) for a, b in zip(mp, my)) / len(my))
-                self.log(f"val/mcq_acc_{ds}", acc_mcq, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-                row[f"val_mcq_acc_{ds}"] = acc_mcq
-                all_mcq_y.extend(my); all_mcq_p.extend(mp)
-            if len(ry) > 0:
-                err = [abs(a - b) for a, b in zip(rp, ry)]
-                mae = float(sum(err) / len(err))
-                mse = float(sum((a - b) ** 2 for a, b in zip(rp, ry)) / len(ry))
-                rmse = mse ** 0.5
-                self.log(f"val/mae_{ds}", mae, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-                self.log(f"val/rmse_{ds}", rmse, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-                row[f"val_mae_{ds}"] = mae
-                row[f"val_rmse_{ds}"] = rmse
-                all_reg_y.extend(ry); all_reg_p.extend(rp)
             me_total = int(bucket.get("moledit_total", 0))
-            if me_total > 0:
-                me_valid = int(bucket.get("moledit_valid", 0))
-                me_exact = int(bucket.get("moledit_exact", 0))
-                me_correct = int(bucket.get("moledit_correct", 0))
-                valid_rate = float(me_valid / me_total)
-                exact_rate = float(me_exact / me_total)
-                correct_rate = float(me_correct / me_total)
-                self.log(f"val/moledit_valid_rate_{ds}", valid_rate, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-                self.log(f"val/moledit_exact_match_rate_{ds}", exact_rate, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-                self.log(f"val/moledit_correct_rate_{ds}", correct_rate, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
-                row[f"val_moledit_valid_rate_{ds}"] = valid_rate
-                row[f"val_moledit_exact_match_rate_{ds}"] = exact_rate
-                row[f"val_moledit_correct_rate_{ds}"] = correct_rate
-                all_me_total += me_total
-                all_me_valid += me_valid
-                all_me_exact += me_exact
-                all_me_correct += me_correct
+            if me_total <= 0:
+                continue
+            me_valid = int(bucket.get("moledit_valid", 0))
+            me_exact = int(bucket.get("moledit_exact", 0))
+            me_correct = int(bucket.get("moledit_correct", 0))
+            valid_rate = float(me_valid / me_total)
+            exact_rate = float(me_exact / me_total)
+            correct_rate = float(me_correct / me_total)
 
-        if len(all_bin_y) > 0:
-            acc = float(sum(int(a == b) for a, b in zip(all_bin_p, all_bin_y)) / len(all_bin_y))
-            auc = self._binary_auc(all_bin_y, all_bin_s)
-            self.log("val/acc", acc, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
-            row["val_acc"] = acc
-            if auc is not None:
-                self.log("val/auc", auc, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
-                row["val_auc"] = auc
-        if len(all_mcq_y) > 0:
-            acc_mcq = float(sum(int(a == b) for a, b in zip(all_mcq_p, all_mcq_y)) / len(all_mcq_y))
-            self.log("val/mcq_acc", acc_mcq, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
-            row["val_mcq_acc"] = acc_mcq
-        if len(all_reg_y) > 0:
-            err = [abs(a - b) for a, b in zip(all_reg_p, all_reg_y)]
-            mae = float(sum(err) / len(err))
-            mse = float(sum((a - b) ** 2 for a, b in zip(all_reg_p, all_reg_y)) / len(all_reg_y))
-            rmse = mse ** 0.5
-            self.log("val/mae", mae, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
-            self.log("val/rmse", rmse, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
-            row["val_mae"] = mae
-            row["val_rmse"] = rmse
+            self.log(f"val/moledit_valid_rate_{ds}", valid_rate, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+            self.log(f"val/moledit_exact_match_rate_{ds}", exact_rate, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+            self.log(f"val/moledit_correct_rate_{ds}", correct_rate, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=False)
+            row[f"val_moledit_valid_rate_{ds}"] = valid_rate
+            row[f"val_moledit_exact_match_rate_{ds}"] = exact_rate
+            row[f"val_moledit_correct_rate_{ds}"] = correct_rate
+
+            all_me_total += me_total
+            all_me_valid += me_valid
+            all_me_exact += me_exact
+            all_me_correct += me_correct
+
         if all_me_total > 0:
             me_valid_rate = float(all_me_valid / all_me_total)
             me_exact_rate = float(all_me_exact / all_me_total)
             me_correct_rate = float(all_me_correct / all_me_total)
-            self.log("val/moledit_valid_rate", me_valid_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
-            self.log("val/moledit_exact_match_rate", me_exact_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
-            self.log("val/moledit_correct_rate", me_correct_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
-            row["val_moledit_valid_rate"] = me_valid_rate
-            row["val_moledit_exact_match_rate"] = me_exact_rate
-            row["val_moledit_correct_rate"] = me_correct_rate
+        else:
+            me_valid_rate = 0.0
+            me_exact_rate = 0.0
+            me_correct_rate = 0.0
 
-        # Add dynamic per-dataset val metrics (e.g. BACE/BBBP/HIV/Clintox/Delaney/LIPO/Tox21).
-        for k in list(metrics.keys()):
-            if not isinstance(k, str):
-                continue
-            if k.startswith("val/score_") or k.startswith("val/loss_"):
-                row[k.replace("/", "_")] = _to_float(k, 0.0)
+        # Define unified score as overall moledit correct_rate for checkpoint ranking.
+        self.log("val/score", me_correct_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
+        self.log("val/moledit_valid_rate", me_valid_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
+        self.log("val/moledit_exact_match_rate", me_exact_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
+        self.log("val/moledit_correct_rate", me_correct_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
+        row["val_score"] = me_correct_rate
+        row["val_moledit_valid_rate"] = me_valid_rate
+        row["val_moledit_exact_match_rate"] = me_exact_rate
+        row["val_moledit_correct_rate"] = me_correct_rate
 
         csv_path = self.test_results_csv_path
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)

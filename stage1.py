@@ -250,13 +250,9 @@ def main():
     trainer_accelerator, trainer_devices, trainer_strategy, trainer_num_nodes, trainer_sync_bn = _resolve_trainer_runtime(
         train_config
     )
-    val_interval_cfg = _cfg_get(stage1_cfg, "eval_every_n_steps", 200)
-    try:
-        val_check_interval = float(val_interval_cfg)
-    except (TypeError, ValueError):
-        val_check_interval = 200.0
-    if val_check_interval > 1:
-        val_check_interval = int(val_check_interval)
+    # Run evaluation every 200 optimizer steps.
+    val_check_interval = 200
+    print(f"[Stage1] evaluation interval: every {val_check_interval} steps")
 
     trainer = pl.Trainer(
         accelerator=trainer_accelerator,

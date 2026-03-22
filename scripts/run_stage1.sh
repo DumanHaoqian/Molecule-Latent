@@ -12,7 +12,7 @@ mkdir -p logs
 RUN_NAME="naive-lr-4slots"
 
 # Directly edit GPUs here, no extra CLI args needed.
-CUDA_VISIBLE_DEVICES="2"
+CUDA_VISIBLE_DEVICES="3"
 # =====================
 
 if [[ -z "${RUN_NAME// }" ]]; then
