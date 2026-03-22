@@ -75,6 +75,9 @@ class Stage1Trainer(pl.LightningModule):
         self.latent_viz_out_dir = str(
             getattr(stage1_cfg, "latent_viz_out_dir", "/home/haoqian/Data/Molecule/Latent/latent_viz")
         )
+        # Baseline-1: train with forward_stage1_base (graph-conditioned CE LM only, no latent rollout/alignment).
+        # Default True preserves full latent reasoning training.
+        self.use_latent_training = bool(getattr(stage1_cfg, "use_latent_training", True))
 
         # WM regression normalization and molecular_weight curriculum.
         # Default stds roughly match common chemistry ranges; can be overridden in config.
@@ -102,7 +105,8 @@ class Stage1Trainer(pl.LightningModule):
         self.non_mw_reg_scale = float(getattr(stage1_cfg, "non_mw_reg_scale", 0.5))
 
         self._init_binary_label_token_ids()
-    
+        print(f"[Stage1Trainer] use_latent_training={self.use_latent_training}")
+
     def maybe_autocast(self, dtype=torch.float16):
         # if on cpu, don't use autocast
         # if on gpu, use autocast with dtype if provided, otherwise use torch.float16
@@ -587,16 +591,21 @@ class Stage1Trainer(pl.LightningModule):
         if self.scheduler:
             self.scheduler.step(self.trainer.current_epoch, self.trainer.global_step)
         batch_size = batch["input_ids"].size(0)
-        outputs = self.mol_llama.forward_stage1(batch)
-        self._save_latent_visualization(outputs, batch)
-
-        lm_loss = outputs["lm_loss"] if outputs["lm_loss"] is not None else torch.tensor(0.0, device=self.device)
-        latent_loss = self._compute_latent_loss(
-            outputs["latent_states"],
-            outputs["slot_targets"],
-            batch["latent_slot_mask"].to(outputs["latent_states"].device),
-        )
-        loss = self.lambda_lm * lm_loss + self.lambda_latent * latent_loss
+        if self.use_latent_training:
+            outputs = self.mol_llama.forward_stage1(batch)
+            self._save_latent_visualization(outputs, batch)
+            lm_loss = outputs["lm_loss"] if outputs["lm_loss"] is not None else torch.tensor(0.0, device=self.device)
+            latent_loss = self._compute_latent_loss(
+                outputs["latent_states"],
+                outputs["slot_targets"],
+                batch["latent_slot_mask"].to(outputs["latent_states"].device),
+            )
+            loss = self.lambda_lm * lm_loss + self.lambda_latent * latent_loss
+        else:
+            outputs = self.mol_llama.forward_stage1_base(batch)
+            lm_loss = outputs["lm_loss"] if outputs["lm_loss"] is not None else torch.tensor(0.0, device=self.device)
+            latent_loss = torch.tensor(0.0, device=self.device)
+            loss = self.lambda_lm * lm_loss
 
         valid_slot_mean = float(batch["latent_slot_mask"].float().sum(dim=1).mean().item())
         prop_cnt = batch["property_regression_mask"].float().sum(dim=1) + batch["property_classification_mask"].float().sum(dim=1)
@@ -618,8 +627,9 @@ class Stage1Trainer(pl.LightningModule):
         self.log("train/lr", self.trainer.optimizers[0].param_groups[0]['lr'], on_step=True, on_epoch=False, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
 
         if self.global_step % 100 == 0:
+            mode = "latent" if self.use_latent_training else "lm_baseline"
             print(
-                f"[Stage1] step={self.global_step} task={task_type} source={source_name} "
+                f"[Stage1] mode={mode} step={self.global_step} task={task_type} source={source_name} "
                 f"loss={float(loss):.4f} lm={float(lm_loss):.4f} "
                 f"latent={float(latent_loss):.4f} "
                 f"slot_mean={valid_slot_mean:.2f} prop_mean={valid_prop_mean:.2f}"
@@ -629,7 +639,7 @@ class Stage1Trainer(pl.LightningModule):
 
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
-        if self.use_base_forward_for_validation:
+        if (not self.use_latent_training) or self.use_base_forward_for_validation:
             outputs = self.mol_llama.forward_stage1_base(batch)
         else:
             outputs = self.mol_llama.forward_stage1(batch)

@@ -62,6 +62,9 @@ wm_classification_targets:
   - ro5_violation_count
 
 stage1:
+  # Full latent reasoning training (default). Set to false for Baseline-1: same data/checkpoint,
+  # graph-conditioned LM via forward_stage1_base only (no latent rollout / alignment).
+  use_latent_training: false # false for Baseline-1, true for latent reasoning training
   max_latent_slots: 4
   use_task_tokens: true
   use_mixed_stage1_training: true
