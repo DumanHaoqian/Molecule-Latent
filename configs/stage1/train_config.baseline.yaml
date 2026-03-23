@@ -1,0 +1,107 @@
+# Baseline-1 (LM-only via forward_stage1_base). Use with scripts/run_stage1_baseline.sh
+# Main latent training uses train_config.yaml instead.
+
+filename: stage1
+
+strategy_name: auto
+accelerator: gpu
+devices:
+  - 0
+num_nodes: 1
+sync_batchnorm: false
+use_accelerate_launch: false
+accelerate_strategy: ddp
+accelerate_devices_per_process: 1
+accelerate_num_nodes: 1
+precision: bf16-mixed
+max_epochs: 5
+check_val_every_n_epoch: 1
+save_every_n_epochs: 5
+accumulate_grad_batches: 1
+
+weight_decay: 0.05
+init_lr: 1.0e-4
+min_lr: 5.0e-6
+warmup_lr: 1.0e-6
+warmup_steps: 1000
+scheduler: linear_warmup_cosine_lr
+
+tune_gnn: False
+temperature: 0.1
+seed: 42
+enable_flash: False
+
+model:
+  stage0_checkpoint_path: "/home/haoqian/Data/Molecule/Latent/checkpoints/hf/Mol-Llama-3.1-8B-Instruct"
+  llm_model: "meta-llama/Llama-3.1-8B-Instruct"
+
+stage1_mixed_training: True
+use_task_tokens: True
+max_latent_slots: 4
+latent_slot_text_max_len: 48
+
+source_sampling_weights:
+  pubchem: 0.8
+  conversation: 0.2
+
+loss_weights:
+  latent: 1.0
+  lm: 1
+
+wm_regression_targets:
+  - molecular_weight
+  - logp
+  - tpsa
+  - hbd
+  - hba
+  - num_rings
+  - aromatic_ring_count
+  - qed
+
+wm_classification_targets:
+  - ro5_pass
+  - ro5_violation_count
+
+stage1:
+  use_latent_training: false
+  max_latent_slots: 0
+  use_task_tokens: true
+  use_mixed_stage1_training: true
+  eval_every_n_steps: 200
+  # 0 = disable (Baseline-1 does not run viz anyway).
+  latent_viz_every_n_steps: 0
+  latent_viz_max_samples: 8
+  latent_viz_out_dir: "/home/haoqian/Data/Molecule/Latent/latent_viz"
+  eval_before_training: false
+  eval_before_training_use_base_forward: true
+  test_results_csv_path: "/home/haoqian/Data/Molecule/Latent/test_baseline.csv"
+  mw_warmup_start: 5.0
+  mw_warmup_end: 1.0
+  mw_warmup_steps: 2000
+  non_mw_reg_scale: 0.5
+  regression_target_stds:
+    molecular_weight: 500.0
+    logp: 5.0
+    tpsa: 150.0
+    hbd: 5.0
+    hba: 10.0
+    num_rings: 6.0
+    aromatic_ring_count: 4.0
+    qed: 1.0
+  regression_targets:
+    - molecular_weight
+    - logp
+    - tpsa
+    - hbd
+    - hba
+    - num_rings
+    - aromatic_ring_count
+    - qed
+  classification_targets:
+    - ro5_pass
+    - ro5_violation_count
+
+use_wandb: True
+wandb_mode: online
+wandb_project: latent-wm-v3
+wandb_run_name: text-baseline-molllama
