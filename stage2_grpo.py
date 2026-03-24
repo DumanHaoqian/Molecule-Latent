@@ -15,8 +15,8 @@ from utils.configuration_mol_llama import MolLLaMAConfig
 
 
 def _load_configs(train_cfg_path=None, data_cfg_path=None):
-    train_cfg_path = train_cfg_path or os.path.join("configs", "stage2_grpo", "train_config.yaml")
-    data_cfg_path = data_cfg_path or os.path.join("configs", "stage2_grpo", "data_config.yaml")
+    train_cfg_path = train_cfg_path or os.path.join("configs", "stage2", "train_config.yaml")
+    data_cfg_path = data_cfg_path or os.path.join("configs", "stage2", "data_config.yaml")
     train_config = OmegaConf.load(train_cfg_path)
     data_config = OmegaConf.load(data_cfg_path)
     return train_config, data_config
@@ -96,8 +96,8 @@ def _sanitize_name(name: str, max_len: int = 64) -> str:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train_config", default=os.path.join("configs", "stage2_grpo", "train_config.yaml"))
-    parser.add_argument("--data_config", default=os.path.join("configs", "stage2_grpo", "data_config.yaml"))
+    parser.add_argument("--train_config", default=os.path.join("configs", "stage2", "train_config.yaml"))
+    parser.add_argument("--data_config", default=os.path.join("configs", "stage2", "data_config.yaml"))
     parser.add_argument("--run_name", default="")
     args = parser.parse_args()
 
@@ -110,6 +110,11 @@ def main():
     model_cfg = _cfg_get(train_config, "model", {})
     stage2_cfg = _cfg_get(train_config, "stage2", {})
     data_cfg = _cfg_get(data_config, "data", {})
+    eval_moledit_test_paths = _cfg_get(data_cfg, "eval_moledit_test_paths", [])
+    if isinstance(eval_moledit_test_paths, str):
+        eval_moledit_test_paths = [eval_moledit_test_paths]
+    else:
+        eval_moledit_test_paths = list(eval_moledit_test_paths or [])
 
     llm_model_name = str(_cfg_get(model_cfg, "llm_model", "meta-llama/Llama-3.1-8B-Instruct"))
     model_config = MolLLaMAConfig()
@@ -144,11 +149,14 @@ def main():
         latent_slot_text_max_len=int(_cfg_get(data_cfg, "latent_slot_text_max_len", 48)),
         latent_world_modeling_path=str(_cfg_get(data_cfg, "latent_path", "")),
         conversation_sft_path=str(_cfg_get(data_cfg, "conversation_path", "")),
+        moledit_path=str(_cfg_get(data_cfg, "moledit_path", "")),
         stage2_path=str(_cfg_get(data_cfg, "stage2_path", "")),
+        eval_moledit_test_paths=eval_moledit_test_paths,
+        eval_moledit_sample_per_task=int(_cfg_get(data_cfg, "eval_moledit_sample_per_task", 0)),
         moledit_val_path=str(_cfg_get(data_cfg, "moledit_val_path", "")),
         fallback_raw_paths=_to_plain(_cfg_get(data_cfg, "fallback_raw_paths", {})),
         enabled_sources=list(_cfg_get(data_cfg, "enabled_sources", ["pubchem", "conversation", "stage2"])),
-        replay_sources=list(_cfg_get(data_cfg, "replay_sources", ["pubchem", "conversation"])),
+        replay_sources=list(_cfg_get(data_cfg, "replay_sources", ["pubchem", "conversation", "moledit"])),
         rl_sources=list(_cfg_get(data_cfg, "rl_sources", ["stage2"])),
         replay_ratio=float(_cfg_get(data_cfg, "replay_ratio", _cfg_get(data_cfg, "sft_ratio", 0.1))),
         rl_ratio=float(_cfg_get(data_cfg, "rl_ratio", 0.9)),
@@ -203,7 +211,8 @@ def main():
         dir_tag_parts.append(run_id_tag)
     ckpt_dir = os.path.join("checkpoints", "stage2_grpo", "-".join(dir_tag_parts))
 
-    has_eval_data = bool(str(_cfg_get(data_cfg, "moledit_val_path", "")).strip())
+    has_eval_data = len(eval_moledit_test_paths) > 0
+    has_eval_data = has_eval_data or bool(str(_cfg_get(data_cfg, "moledit_val_path", "")).strip())
     if has_eval_data:
         monitor_name = "val/score"
         monitor_mode = "max"

@@ -8,7 +8,7 @@ from pytorch_lightning import LightningDataModule
 from torch.utils.data import BatchSampler, ConcatDataset, DataLoader, Dataset, Subset
 
 from data_provider.collaters import Stage1UnifiedCollater
-from data_provider.stage1_dataset import UnifiedStage1Dataset
+from data_provider.stage1_dataset import UnifiedStage1Dataset, build_moledit_eval_samples_from_json
 from data_provider.tokenization_utils import batch_tokenize_messages_list
 
 
@@ -292,7 +292,10 @@ class Stage2GRPODM(LightningDataModule):
         latent_slot_text_max_len: int = 48,
         latent_world_modeling_path: str = "",
         conversation_sft_path: str = "",
+        moledit_path: str = "",
         stage2_path: str = "",
+        eval_moledit_test_paths=None,
+        eval_moledit_sample_per_task: int = 0,
         moledit_val_path: str = "",
         fallback_raw_paths=None,
         enabled_sources=None,
@@ -325,12 +328,17 @@ class Stage2GRPODM(LightningDataModule):
 
         self.latent_world_modeling_path = latent_world_modeling_path
         self.conversation_sft_path = conversation_sft_path
+        self.moledit_path = moledit_path
         self.stage2_path = stage2_path
+        if isinstance(eval_moledit_test_paths, str):
+            eval_moledit_test_paths = [eval_moledit_test_paths]
+        self.eval_moledit_test_paths = list(eval_moledit_test_paths or [])
+        self.eval_moledit_sample_per_task = int(eval_moledit_sample_per_task)
         self.moledit_val_path = moledit_val_path
         self.fallback_raw_paths = fallback_raw_paths or {}
 
-        self.enabled_sources = list(enabled_sources or ["pubchem", "conversation", "stage2"])
-        self.replay_sources = list(replay_sources or ["pubchem", "conversation"])
+        self.enabled_sources = list(enabled_sources or ["pubchem", "conversation", "moledit", "stage2"])
+        self.replay_sources = list(replay_sources or ["pubchem", "conversation", "moledit"])
         self.rl_sources = list(rl_sources or ["stage2"])
         self.replay_ratio = float(replay_ratio)
         self.rl_ratio = float(rl_ratio)
@@ -356,10 +364,17 @@ class Stage2GRPODM(LightningDataModule):
         resolved = {
             "pubchem": self.latent_world_modeling_path,
             "conversation": self.conversation_sft_path,
+            "moledit": self.moledit_path,
             "stage2": self.stage2_path,
             "val_moledit": self.moledit_val_path,
         }
-        for key, fallback_key in [("pubchem", "latent_path"), ("conversation", "conversation_path"), ("stage2", "stage2_path"), ("val_moledit", "moledit_val_path")]:
+        for key, fallback_key in [
+            ("pubchem", "latent_path"),
+            ("conversation", "conversation_path"),
+            ("moledit", "moledit_path"),
+            ("stage2", "stage2_path"),
+            ("val_moledit", "moledit_val_path"),
+        ]:
             if (not resolved[key]) and self.fallback_raw_paths.get(fallback_key):
                 resolved[key] = self.fallback_raw_paths.get(fallback_key)
         return resolved
@@ -390,6 +405,12 @@ class Stage2GRPODM(LightningDataModule):
             frac = float(self.total_data_fraction_by_source.get("conversation", self.total_data_fraction))
             ds = _fraction_subset(ds, frac, self.split_seed + 23)
             datasets["conversation"] = ds
+
+        if "moledit" in self.enabled_sources and resolved.get("moledit"):
+            ds = self._build_unified_dataset(resolved["moledit"], "MolEditLatent")
+            frac = float(self.total_data_fraction_by_source.get("moledit", self.total_data_fraction))
+            ds = _fraction_subset(ds, frac, self.split_seed + 31)
+            datasets["moledit"] = ds
 
         if "stage2" in self.enabled_sources and resolved.get("stage2"):
             ds = self._build_unified_dataset(resolved["stage2"], "OpenMolInsStage2")
@@ -432,7 +453,23 @@ class Stage2GRPODM(LightningDataModule):
         )
 
         self.val_dataset = None
-        if resolved.get("val_moledit") and os.path.exists(resolved["val_moledit"]):
+        if len(self.eval_moledit_test_paths) > 0:
+            eval_samples = build_moledit_eval_samples_from_json(
+                self.eval_moledit_test_paths,
+                sample_per_task=self.eval_moledit_sample_per_task,
+                seed=self.split_seed,
+            )
+            self.val_dataset = UnifiedStage1Dataset(
+                data_paths=[],
+                source_name="MolEditEval",
+                task_type="downstream",
+                unimol_dictionary=self.unimol_dictionary,
+                encoder_types=self.encoder_types,
+                max_latent_slots=self.max_latent_slots,
+                use_task_tokens=True,
+                preloaded_samples=eval_samples,
+            )
+        elif resolved.get("val_moledit") and os.path.exists(resolved["val_moledit"]):
             val_ds = self._build_unified_dataset(resolved["val_moledit"], "MolEditVal")
             val_ds = _filter_dataset_by_subtasks(val_ds, self.val_subtasks)
             self.val_dataset = val_ds
@@ -448,7 +485,7 @@ class Stage2GRPODM(LightningDataModule):
             text_max_len=self.text_max_len,
             regression_targets=self.regression_targets,
             classification_targets=self.classification_targets,
-            replay_source_names=["PubChemLatent", "ComprehensiveConversation"],
+            replay_source_names=["PubChemLatent", "ComprehensiveConversation", "MolEditLatent"],
         )
         return DataLoader(
             self.train_dataset,

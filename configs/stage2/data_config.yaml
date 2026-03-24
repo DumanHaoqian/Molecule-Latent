@@ -7,21 +7,27 @@ data:
   # Replay / SFT sources from Stage I.
   latent_path: "/home/haoqian/Data/Molecule/Datasets/Train/02PubChem/latent_world_modeling.jsonl"
   conversation_path: "/home/haoqian/Data/Molecule/Datasets/Train/01Conversation/conversation_sft_with_worldmodel.jsonl"
+  moledit_path: "/home/haoqian/Data/Molecule/Datasets/Train/03MolEdit/mol_edit_with_worldmodel.jsonl"
 
   # Stage-II unified jsonl converted from TOMG-Bench / OpenMolIns CSV.
   stage2_path: "/home/haoqian/Data/Molecule/Construction/Datasets/05TomgBench/train_small_worldmodel.jsonl"
-
-  # Validation set: use the Stage-I MolEdit validation jsonl here.
-  moledit_val_path: "/home/haoqian/Data/Molecule/Datasets/Train/03MolEdit/mol_edit_with_worldmodel_val.jsonl"
+  # Validation set (same style as Stage-I): three MolEdit test jsons.
+  eval_moledit_test_paths:
+    - "/home/haoqian/Data/Molecule/Datasets/Test/01_mol_edit/add.json"
+    - "/home/haoqian/Data/Molecule/Datasets/Test/01_mol_edit/delete.json"
+    - "/home/haoqian/Data/Molecule/Datasets/Test/01_mol_edit/sub.json"
+  eval_moledit_sample_per_task: 0
 
   enabled_sources:
     - pubchem
     - conversation
+    - moledit
     - stage2
 
   replay_sources:
     - pubchem
     - conversation
+    - moledit
   rl_sources:
     - stage2
 
@@ -32,8 +38,9 @@ data:
 
   # How to mix sources inside each group.
   replay_source_weights:
-    pubchem: 0.5
-    conversation: 0.5
+    pubchem: 0.2
+    conversation: 0.3
+    moledit: 0.5
   rl_source_weights:
     stage2: 1.0
 
@@ -46,6 +53,14 @@ data:
   # Leave empty to use all.
   stage2_subtasks:
     - AtomNum
+    - BondNum
+    - FunctionalGroup
+    - AddComponent
+    - SubComponent
+    - DelComponent
+    - LogP
+    - MR
+    - QED
   val_subtasks: []
 
   split_seed: 42

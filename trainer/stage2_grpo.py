@@ -166,6 +166,13 @@ class Stage2GRPOTrainer(Stage1Trainer):
         stage2_cfg = getattr(train_config, "stage2", {})
 
         self.num_grpo_generations = int(getattr(stage2_cfg, "num_grpo_generations", 4))
+        self.num_latent_steps = int(
+            getattr(
+                stage2_cfg,
+                "num_latent_steps",
+                getattr(stage2_cfg, "max_latent_slots", getattr(self.mol_llama, "stage1_max_latent_slots", 4)),
+            )
+        )
         self.grpo_clip_eps = float(getattr(stage2_cfg, "grpo_clip_eps", 0.2))
         self.grpo_kl_beta = float(getattr(stage2_cfg, "grpo_kl_beta", 0.01))
 
@@ -239,7 +246,7 @@ class Stage2GRPOTrainer(Stage1Trainer):
         latent_list = []
         for bi in range(prompt_embeds.size(0)):
             prefix_embeds = self.mol_llama._extract_valid_prefix_embeds(prompt_embeds[bi], prompt_mask[bi])
-            latent_seq = self.mol_llama._rollout_latent_tokens(prefix_embeds, num_steps=self.mol_llama.stage1_max_latent_slots)
+            latent_seq = self.mol_llama._rollout_latent_tokens(prefix_embeds, num_steps=self.num_latent_steps)
             latent_list.append(latent_seq)
         latent_seq = torch.stack(latent_list, dim=0)
 

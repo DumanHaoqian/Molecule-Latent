@@ -21,8 +21,8 @@ LOG_FILE="/home/haoqian/Data/Molecule/Latent/logs/stage2_grpo_${RUN_TAG}_${TIMES
 
 nohup env CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES}" \
 python /home/haoqian/Data/Molecule/Latent/stage2_grpo.py \
-  --train_config /home/haoqian/Data/Molecule/Latent/configs/stage2_grpo/train_config.yaml \
-  --data_config /home/haoqian/Data/Molecule/Latent/configs/stage2_grpo/data_config.yaml \
+  --train_config /home/haoqian/Data/Molecule/Latent/configs/stage2/train_config.yaml \
+  --data_config /home/haoqian/Data/Molecule/Latent/configs/stage2/data_config.yaml \
   --run_name "${RUN_NAME}" \
 > "${LOG_FILE}" 2>&1 &
 

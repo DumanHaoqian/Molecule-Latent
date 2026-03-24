@@ -1,9 +1,10 @@
 filename: stage2_grpo
 
-strategy_name: auto
+strategy_name: ddp
 accelerator: gpu
 devices:
   - 0
+  - 1
 num_nodes: 1
 sync_batchnorm: false
 precision: bf16-mixed
@@ -24,7 +25,7 @@ enable_flash: false
 
 model:
   stage0_checkpoint_path: "/home/haoqian/Data/Molecule/Latent/checkpoints/hf/Mol-Llama-3.1-8B-Instruct"
-  stage1_checkpoint_path: ""
+  stage1_checkpoint_path: "/home/haoqian/Data/Molecule/Latent/checkpoints/stage1/naive-lr-4slots-stepstep=00028024.ckpt"
   stage2_checkpoint_path: ""
   llm_model: "meta-llama/Llama-3.1-8B-Instruct"
 
