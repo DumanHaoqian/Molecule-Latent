@@ -125,6 +125,10 @@ class SimpleUniMolModel(BaseUnicoreModel):
         src_distance,
         src_edge_type,
     ):
+        # Safety guard: avoid invalid embedding indices from noisy/converted inputs.
+        # This prevents CUDA device-side asserts from indexSelect on DDP sanity val.
+        src_tokens = src_tokens.clamp(min=0, max=self.embed_tokens.num_embeddings - 1)
+        src_edge_type = src_edge_type.clamp(min=0, max=self.gbf.mul.num_embeddings - 1)
         padding_mask = src_tokens.eq(self.padding_idx).bool()
         x = self.embed_tokens(src_tokens)
 

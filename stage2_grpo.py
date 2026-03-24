@@ -55,9 +55,11 @@ def _resolve_trainer_runtime(train_config):
     world_size = _env_int("WORLD_SIZE", 1)
     local_rank = _env_int("LOCAL_RANK", -1)
     rank = _env_int("RANK", 0)
-    launched_multi_process = world_size > 1 and local_rank >= 0
 
-    if use_accelerate_launch or launched_multi_process:
+    # Important: when Lightning launches DDP subprocesses itself, WORLD_SIZE/LOCAL_RANK
+    # are already set in child processes. Do not override devices there, otherwise
+    # `devices_per_process=1` can conflict with local_rank>0 and crash.
+    if use_accelerate_launch:
         strategy = str(getattr(train_config, "accelerate_strategy", "ddp"))
         devices = int(getattr(train_config, "accelerate_devices_per_process", 1))
         num_nodes = int(getattr(train_config, "accelerate_num_nodes", 1))
@@ -238,6 +240,9 @@ def main():
         strategy=trainer_strategy,
         num_nodes=trainer_num_nodes,
         sync_batchnorm=trainer_sync_bn,
+        # Stage2GRPODM uses a custom BatchSampler for replay/RL mixing.
+        # Let the datamodule handle sampling; do not let Lightning inject a distributed sampler.
+        use_distributed_sampler=False,
         precision=train_config.precision,
         max_epochs=int(train_config.max_epochs),
         check_val_every_n_epoch=int(getattr(train_config, "check_val_every_n_epoch", 1)),

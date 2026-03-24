@@ -201,6 +201,16 @@ class Stage2GRPOTrainer(Stage1Trainer):
         if self.train_lora_only:
             self._freeze_for_stage2()
 
+    def _zero_like_trainable_loss(self) -> torch.Tensor:
+        trainable = [p for p in self.parameters() if p.requires_grad]
+        if len(trainable) == 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+        # Build a scalar connected to trainable params so backward() always works.
+        z = trainable[0].sum() * 0.0
+        for p in trainable[1:]:
+            z = z + (p.sum() * 0.0)
+        return z
+
     def _freeze_for_stage2(self):
         for name, p in self.named_parameters():
             p.requires_grad = False
@@ -422,12 +432,26 @@ class Stage2GRPOTrainer(Stage1Trainer):
         old_logprobs = cache.old_logprobs
 
         min_len = min(current_logprobs.size(1), old_logprobs.size(1))
+        if min_len <= 0:
+            zero_loss = self._zero_like_trainable_loss()
+            return zero_loss, {
+                "train/rl_loss": zero_loss.detach(),
+                "train/policy_loss": torch.tensor(0.0, device=self.device),
+                "train/approx_kl": torch.tensor(0.0, device=self.device),
+                "train/reward_mean": rewards.mean().detach(),
+                "train/reward_max": rewards.max().detach(),
+                "train/grpo_invalid_batch": torch.tensor(1.0, device=self.device),
+            }
         current_logprobs = current_logprobs[:, :min_len]
         old_logprobs = old_logprobs[:, :min_len]
         valid_mask = valid_mask[:, :min_len]
 
+        current_logprobs = torch.nan_to_num(current_logprobs, nan=0.0, posinf=0.0, neginf=0.0)
+        old_logprobs = torch.nan_to_num(old_logprobs, nan=0.0, posinf=0.0, neginf=0.0)
+
         flat_adv = advantages.reshape(-1).unsqueeze(1).expand_as(current_logprobs)
-        ratio = torch.exp(current_logprobs - old_logprobs)
+        log_ratio = torch.clamp(current_logprobs - old_logprobs, min=-20.0, max=20.0)
+        ratio = torch.exp(log_ratio)
         clipped_ratio = torch.clamp(ratio, 1.0 - self.grpo_clip_eps, 1.0 + self.grpo_clip_eps)
         obj1 = ratio * flat_adv
         obj2 = clipped_ratio * flat_adv
@@ -435,12 +459,19 @@ class Stage2GRPOTrainer(Stage1Trainer):
         policy_loss = -policy_obj.sum() / valid_mask.sum().clamp(min=1.0)
         approx_kl = ((old_logprobs - current_logprobs) * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
         total_loss = policy_loss + self.grpo_kl_beta * approx_kl
+
+        invalid = (not torch.isfinite(total_loss).item()) or (not total_loss.requires_grad)
+        if invalid:
+            total_loss = self._zero_like_trainable_loss()
+            policy_loss = torch.tensor(0.0, device=self.device)
+            approx_kl = torch.tensor(0.0, device=self.device)
         return total_loss, {
             "train/rl_loss": total_loss.detach(),
             "train/policy_loss": policy_loss.detach(),
             "train/approx_kl": approx_kl.detach(),
             "train/reward_mean": rewards.mean().detach(),
             "train/reward_max": rewards.max().detach(),
+            "train/grpo_invalid_batch": torch.tensor(1.0 if invalid else 0.0, device=self.device),
         }
 
     def training_step(self, batch, batch_idx):

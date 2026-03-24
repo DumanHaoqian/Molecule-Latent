@@ -121,6 +121,8 @@ class MixedGroupBatchSampler(BatchSampler):
 
         self.replay_source_weights = dict(replay_source_weights or {})
         self.rl_source_weights = dict(rl_source_weights or {})
+        self.world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+        self.rank = max(0, int(os.environ.get("RANK", "0")))
 
     def __len__(self):
         return self.steps_per_epoch
@@ -144,7 +146,9 @@ class MixedGroupBatchSampler(BatchSampler):
         return names[-1]
 
     def __iter__(self):
-        rng = random.Random(self.seed + self.epoch)
+        # Different ranks use different RNG streams to avoid identical batches in DDP
+        # when `use_distributed_sampler=False`.
+        rng = random.Random(self.seed + self.epoch + 100003 * self.rank)
         per_source_order = {}
         per_source_ptr = {}
         for source, n in self.source_lengths.items():

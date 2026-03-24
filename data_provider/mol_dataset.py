@@ -93,8 +93,13 @@ def get_unimol_data(atoms, coordinates, dictionary, max_atoms=512, remove_Hs=Tru
     coordinates = coordinates - coordinates.mean(axis=0)
     coordinates = np.concatenate([np.zeros((1, 3)), coordinates, np.zeros((1, 3))], axis=0)
 
-    ## obtain edge types; which is defined as the combination of two atom types
-    edge_type = atom_vec.view(-1, 1) * len(dictionary) + atom_vec.view(1, -1)
+    ## obtain edge types; which is defined as the combination of two atom types.
+    ## UniMol GaussianLayer uses a fixed edge type table size 31*31.
+    ## Clamp ids used for edge-type indexing to avoid out-of-range asserts
+    ## when dictionary ids exceed the supported edge vocabulary range.
+    edge_vocab_size = 31
+    atom_edge_ids = atom_vec.clamp(min=0, max=edge_vocab_size - 1)
+    edge_type = atom_edge_ids.view(-1, 1) * edge_vocab_size + atom_edge_ids.view(1, -1)
     dist = distance_matrix(coordinates, coordinates).astype(np.float32)
     coordinates, dist = torch.from_numpy(coordinates), torch.from_numpy(dist)
 
