@@ -1,8 +1,17 @@
-num_workers: 8
-batch_size: 4
-root: ""
-data_types: []
-train_json_path: Datasets/BBBP/bbbp_latent_reasoning_train.jsonl
-valid_json_path: Datasets/BBBP/bbbp_latent_reasoning_valid.jsonl
-test_json_path: Datasets/BBBP/bbbp_latent_reasoning_test.jsonl
+# Keep this aligned with your Stage I unified data settings.
+# You should replace these with your actual local paths.
 
+batch_size: 2
+num_workers: 4
+text_max_len: 512
+root: .
+
+# Example source controls if your existing config system reads them:
+pubchem_path: /path/to/pubchem_latent_world_modeling.jsonl
+conversation_path: /path/to/conversation_sft.jsonl
+moledit_path: /path/to/moledit_train.jsonl
+
+source_sampling_weights:
+  pubchem: 0.1
+  conversation: 0.1
+  moledit: 0.8

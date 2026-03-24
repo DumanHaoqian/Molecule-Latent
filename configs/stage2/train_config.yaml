@@ -1,37 +1,31 @@
-filename: stage2
-stage2_path: /mnt_nas1/haoqian/Data/Molecule/Latent/checkpoints/hf/Mol-Llama-3.1-8B-Instruct
-stage1_path: ""
-llm_model: meta-llama/Llama-3.1-8B-Instruct
+seed: 42
+output_dir: outputs/stage2_grpo
 
-strategy_name: auto
-accelerator: gpu
-devices:
-  - 0
+llm_model_name_or_path: /path/to/stage1_checkpoint_or_backbone
+
+devices: 1
+strategy: auto
 precision: bf16-mixed
-max_epochs: 20
-check_val_every_n_epoch: 1
-save_every_n_epochs: 1
-accumulate_grad_batches: 16
+max_epochs: 1
+accumulate_grad_batches: 1
+log_every_n_steps: 10
 
-weight_decay: 0.05
-init_lr: 1.0e-4
-min_lr: 5.0e-6
-warmup_lr: 1.0e-6
-warmup_steps: 1000
-scheduler: linear_warmup_cosine_lr
+batch_size: 2
+num_workers: 4
+text_max_len: 512
+root: .
 
-tune_gnn: False
-temperature: 0.1
-enable_flash: False
+num_grpo_generations: 4
+max_generation_len: 128
+grpo_clip_eps: 0.2
+grpo_kl_beta: 0.01
+replay_sft_weight: 1.0
+rl_weight: 1.0
+replay_probability: 0.2
 
-use_latent_reasoning: True
-num_latent_steps: 4
-lambda_latent: 1.0
-lambda_lm: 1.0
-lambda_cls: 0.5
+temperature: 1.0
+top_p: 0.95
+do_sample: true
 
-use_wandb: True
-wandb_mode: online
-wandb_project: mol-llama-latent
-wandb_run_name: stage2-latent-reasoning
-
+train_lora_only: true
+allow_latent_core_update: false

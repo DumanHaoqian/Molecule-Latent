@@ -111,17 +111,22 @@ class Stage1UnifiedCollater:
                         latent_slot_smiles[bi][si] = smi if isinstance(smi, str) else ""
                 else:
                     flat_slot_desc.append("")
-        slot_tokens = self.tokenizer(
-            flat_slot_desc,
-            truncation=True,
-            padding="max_length",
-            max_length=self.latent_slot_text_max_len,
-            add_special_tokens=True,
-            return_tensors="pt",
-            return_attention_mask=True,
-        )
-        latent_slot_input_ids = slot_tokens.input_ids.view(batch_size, self.max_latent_slots, -1)
-        latent_slot_attention_mask = slot_tokens.attention_mask.view(batch_size, self.max_latent_slots, -1)
+        if len(flat_slot_desc) == 0:
+            # Supports max_latent_slots == 0 (e.g., LM-only baseline) by skipping tokenizer call.
+            latent_slot_input_ids = torch.zeros((batch_size, 0, 0), dtype=torch.long)
+            latent_slot_attention_mask = torch.zeros((batch_size, 0, 0), dtype=torch.long)
+        else:
+            slot_tokens = self.tokenizer(
+                flat_slot_desc,
+                truncation=True,
+                padding="max_length",
+                max_length=self.latent_slot_text_max_len,
+                add_special_tokens=True,
+                return_tensors="pt",
+                return_attention_mask=True,
+            )
+            latent_slot_input_ids = slot_tokens.input_ids.view(batch_size, self.max_latent_slots, -1)
+            latent_slot_attention_mask = slot_tokens.attention_mask.view(batch_size, self.max_latent_slots, -1)
 
         property_regression_targets = torch.zeros((batch_size, len(self.reg_keys)), dtype=torch.float32)
         property_regression_mask = torch.zeros((batch_size, len(self.reg_keys)), dtype=torch.bool)
