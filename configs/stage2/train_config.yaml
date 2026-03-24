@@ -1,31 +1,76 @@
-seed: 42
-output_dir: outputs/stage2_grpo
+filename: stage2_grpo
 
-llm_model_name_or_path: /path/to/stage1_checkpoint_or_backbone
-
-devices: 1
-strategy: auto
+strategy_name: auto
+accelerator: gpu
+devices:
+  - 0
+num_nodes: 1
+sync_batchnorm: false
 precision: bf16-mixed
-max_epochs: 1
+max_epochs: 3
 accumulate_grad_batches: 1
-log_every_n_steps: 10
+check_val_every_n_epoch: 1
+val_check_interval_steps: 200
 
-batch_size: 2
-num_workers: 4
-text_max_len: 512
-root: .
+weight_decay: 0.05
+init_lr: 5.0e-6
+min_lr: 5.0e-7
+warmup_lr: 1.0e-7
+warmup_steps: 100
+scheduler: linear_warmup_cosine_lr
 
-num_grpo_generations: 4
-max_generation_len: 128
-grpo_clip_eps: 0.2
-grpo_kl_beta: 0.01
-replay_sft_weight: 1.0
-rl_weight: 1.0
-replay_probability: 0.2
+seed: 42
+enable_flash: false
 
-temperature: 1.0
-top_p: 0.95
-do_sample: true
+model:
+  stage0_checkpoint_path: "/home/haoqian/Data/Molecule/Latent/checkpoints/hf/Mol-Llama-3.1-8B-Instruct"
+  stage1_checkpoint_path: ""
+  stage2_checkpoint_path: ""
+  llm_model: "meta-llama/Llama-3.1-8B-Instruct"
 
-train_lora_only: true
-allow_latent_core_update: false
+stage2:
+  num_latent_steps: 4
+  max_latent_slots: 4
+  num_grpo_generations: 4
+  grpo_clip_eps: 0.2
+  grpo_kl_beta: 0.01
+
+  generation_max_new_tokens: 128
+  generation_min_new_tokens: 1
+  generation_top_p: 0.95
+  generation_temperature: 1.0
+  do_sample: true
+
+  replay_lm_weight: 0.2
+  replay_latent_weight: 1.0
+
+  reward_format_weight: 0.5
+  reward_validity_weight: 2.0
+  reward_task_weight: 3.0
+  reward_faithfulness_weight: 1.0
+  reward_text_match_weight: 0.5
+  similarity_floor: 0.15
+  use_length_guard: true
+  max_smiles_length: 256
+
+  train_lora_only: true
+  allow_latent_core_update: false
+  allow_stage1_bridge_update: false
+
+  regression_targets:
+    - molecular_weight
+    - logp
+    - tpsa
+    - hbd
+    - hba
+    - num_rings
+    - aromatic_ring_count
+    - qed
+  classification_targets:
+    - ro5_pass
+    - ro5_violation_count
+
+use_wandb: true
+wandb_mode: online
+wandb_project: latent-stage2-grpo
+wandb_run_name: stage2-grpo-openmolins

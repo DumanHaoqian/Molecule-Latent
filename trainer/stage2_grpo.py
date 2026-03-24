@@ -1,91 +1,180 @@
-import contextlib
-import json
 import math
-import os
 import re
 from dataclasses import dataclass
-from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
-import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem
-from torch import optim
 
-from models.mol_llama import MolLLaMA
-from trainer.optims import LinearWarmupCosineLRScheduler
+from trainer.stage1 import Stage1Trainer
 
 
-def precision2dtype(precision: str):
-    if precision == "16":
-        return torch.float16
-    if precision == "32":
-        return torch.float32
-    if "bf16" in str(precision):
-        return torch.bfloat16
-    raise NotImplementedError(f"Unsupported precision: {precision}")
+ELEMENT_SYMBOLS = {
+    "H", "C", "N", "O", "F", "P", "S", "Cl", "Br", "I", "Si", "B"
+}
+
+FG_SMARTS = {
+    "amine": "[NX3;H2,H1,H0;!$(N=*)]",
+    "primary_amine": "[NX3;H2;!$(N=*)]",
+    "secondary_amine": "[NX3;H1;!$(N=*)]",
+    "tertiary_amine": "[NX3;H0;!$(N=*)]",
+    "amide": "[NX3][CX3](=O)[#6]",
+    "carboxyl": "[CX3](=O)[OX2H1]",
+    "carboxylate": "[CX3](=O)[O-]",
+    "simple_ester": "[CX3](=O)[OX2][#6]",
+    "lactam": "[NX3;R][CX3;R](=O)",
+    "lactone": "[OX2;R][CX3;R](=O)",
+    "carbamate": "[NX3][CX3](=O)[OX2]",
+    "alcohol": "[OX2H][#6;!$(C=O)]",
+    "phenol": "[OX2H]-c1ccccc1",
+    "alkyl_ether": "[OD2]([#6])[#6]",
+    "aryl_ether": "[OD2]([#6])c",
+    "cyclic_ether": "[OD2;R]([#6])[#6]",
+    "nitrile": "[CX2]#N",
+    "sulfonamide": "S(=O)(=O)N",
+    "phosphate": "P(=O)(O)(O)O",
+    "phosphonate": "P(=O)(O)(O)[#6]",
+    "epoxide": "C1OC1",
+    "benzene": "c1ccccc1",
+    "aryl": "a",
+    "CF3": "[CX4](F)(F)F",
+    "tert_butyl": "C(C)(C)C",
+    "quaternary_ammonium": "[NX4+]",
+    "ammonium": "[NH4+,NH3+,NH2+,NH+]",
+}
 
 
 @dataclass
-class RewardBreakdown:
-    total: float
-    format_reward: float
-    validity_reward: float
-    task_reward: float
-    faithfulness_reward: float
-    text_match_reward: float
+class RolloutCache:
+    prefix_embeds: torch.Tensor
+    prefix_mask: torch.Tensor
+    latent_seq: torch.Tensor
+    generated_ids: torch.Tensor
+    sampled_texts: List[str]
+    old_logprobs: torch.Tensor
 
 
-class Stage2GRPOTrainer(pl.LightningModule):
-    """
-    Stage-II GRPO trainer for Molecule-Latent.
+class _PromptBatch:
+    pass
 
-    Design choices intentionally follow the current repository structure:
-    - reuse MolLLaMA._build_prefill_inputs_embeds / _rollout_latent_tokens
-    - optimize only text completion logprobs conditioned on replayed latent states
-    - keep a small Stage-I replay path to stabilize latent reasoning
-    - freeze encoder / latent interface by default, train LoRA adapters on the LLM
-    """
 
+def _extract_answer_text(text: str) -> str:
+    if text is None:
+        return ""
+    txt = str(text).strip()
+    m = re.search(r"<answer>(.*?)</answer>", txt, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    if "Answer:" in txt:
+        return txt.split("Answer:", 1)[1].strip()
+    return txt
+
+
+def _find_valid_smiles(text: str) -> Optional[str]:
+    if text is None:
+        return None
+    answer = _extract_answer_text(text)
+    candidates = [answer, text]
+    for cand in candidates:
+        toks = re.findall(r"[A-Za-z0-9@+\-\[\]\(\)=#$\\/.]+", cand)
+        toks = sorted(set(toks), key=len, reverse=True)
+        for tok in toks:
+            try:
+                mol = Chem.MolFromSmiles(tok)
+                if mol is not None:
+                    return Chem.MolToSmiles(mol, canonical=True)
+            except Exception:
+                continue
+    return None
+
+
+def _tanimoto(smiles_a: Optional[str], smiles_b: Optional[str]) -> float:
+    if not smiles_a or not smiles_b:
+        return 0.0
+    try:
+        ma = Chem.MolFromSmiles(smiles_a)
+        mb = Chem.MolFromSmiles(smiles_b)
+        if ma is None or mb is None:
+            return 0.0
+        fa = AllChem.GetMorganFingerprintAsBitVect(ma, 2, nBits=2048)
+        fb = AllChem.GetMorganFingerprintAsBitVect(mb, 2, nBits=2048)
+        return float(DataStructs.TanimotoSimilarity(fa, fb))
+    except Exception:
+        return 0.0
+
+
+def _atomic_counts(mol: Chem.Mol) -> Dict[str, int]:
+    out: Dict[str, int] = {}
+    for atom in mol.GetAtoms():
+        sym = atom.GetSymbol()
+        out[sym] = out.get(sym, 0) + 1
+    return out
+
+
+def _bond_profile(mol: Chem.Mol) -> Dict[str, int]:
+    out = {"single": 0, "double": 0, "triple": 0, "aromatic": 0, "total": 0}
+    for bond in mol.GetBonds():
+        out["total"] += 1
+        bt = bond.GetBondType()
+        if bond.GetIsAromatic():
+            out["aromatic"] += 1
+        elif bt == Chem.rdchem.BondType.SINGLE:
+            out["single"] += 1
+        elif bt == Chem.rdchem.BondType.DOUBLE:
+            out["double"] += 1
+        elif bt == Chem.rdchem.BondType.TRIPLE:
+            out["triple"] += 1
+    return out
+
+
+def _functional_group_score(mol: Chem.Mol, required_groups: List[str]) -> float:
+    if mol is None:
+        return 0.0
+    if not required_groups:
+        return 0.0
+    hits = 0
+    total = 0
+    for name in required_groups:
+        patt = FG_SMARTS.get(str(name), None)
+        if patt is None:
+            continue
+        total += 1
+        smarts = Chem.MolFromSmarts(patt)
+        if smarts is not None and mol.HasSubstructMatch(smarts):
+            hits += 1
+    if total == 0:
+        return 0.0
+    return float(hits / total)
+
+
+def _scaled_exactish_reward(pred: Dict[str, int], target: Dict[str, int]) -> float:
+    if not target:
+        return 0.0
+    vals = []
+    for k, v in target.items():
+        gt = int(v)
+        pd = int(pred.get(k, 0))
+        vals.append(max(0.0, 1.0 - abs(pd - gt) / max(1, gt)))
+    return float(sum(vals) / max(1, len(vals)))
+
+
+class Stage2GRPOTrainer(Stage1Trainer):
     def __init__(self, vocab_size, model_config, train_config, tokenizer=None):
-        super().__init__()
-        self.train_config = train_config
-        self.tokenizer = tokenizer
-
-        stage2_cfg = getattr(train_config, "stage2", SimpleNamespace())
-        torch_dtype = precision2dtype(train_config.precision)
-        torch_dtype_name = {
-            torch.float16: "float16",
-            torch.float32: "float32",
-            torch.bfloat16: "bfloat16",
-        }[torch_dtype]
-
-        self.mol_llama = MolLLaMA(
-            config=model_config,
-            vocab_size=vocab_size,
-            torch_dtype=torch_dtype_name,
-            enable_flash=getattr(train_config, "enable_flash", False),
-            use_latent_reasoning=True,
-            num_latent_steps=int(getattr(stage2_cfg, "num_latent_steps", 4)),
-            lambda_latent=float(getattr(stage2_cfg, "lambda_latent", 1.0)),
-            lambda_lm=float(getattr(stage2_cfg, "lambda_lm", 1.0)),
-            lambda_cls=float(getattr(stage2_cfg, "lambda_cls", 0.5)),
-            stage1_max_latent_slots=int(getattr(stage2_cfg, "max_latent_slots", getattr(stage2_cfg, "num_latent_steps", 4))),
-            stage1_wm_reg_keys=list(getattr(stage2_cfg, "regression_targets", [])),
-            stage1_wm_cls_keys=list(getattr(stage2_cfg, "classification_targets", [])),
-        )
+        super().__init__(vocab_size=vocab_size, model_config=model_config, train_config=train_config, tokenizer=tokenizer)
+        stage2_cfg = getattr(train_config, "stage2", {})
 
         self.num_grpo_generations = int(getattr(stage2_cfg, "num_grpo_generations", 4))
-        self.num_latent_steps = int(getattr(stage2_cfg, "num_latent_steps", 4))
         self.grpo_clip_eps = float(getattr(stage2_cfg, "grpo_clip_eps", 0.2))
+        self.grpo_kl_beta = float(getattr(stage2_cfg, "grpo_kl_beta", 0.01))
+
         self.generation_max_new_tokens = int(getattr(stage2_cfg, "generation_max_new_tokens", 128))
         self.generation_min_new_tokens = int(getattr(stage2_cfg, "generation_min_new_tokens", 1))
         self.generation_top_p = float(getattr(stage2_cfg, "generation_top_p", 0.95))
         self.generation_temperature = float(getattr(stage2_cfg, "generation_temperature", 1.0))
-        self.replay_lm_weight = float(getattr(stage2_cfg, "replay_lm_weight", 0.2))
-        self.replay_latent_weight = float(getattr(stage2_cfg, "replay_latent_weight", 1.0))
+        self.do_sample = bool(getattr(stage2_cfg, "do_sample", True))
+
         self.reward_format_weight = float(getattr(stage2_cfg, "reward_format_weight", 0.5))
         self.reward_validity_weight = float(getattr(stage2_cfg, "reward_validity_weight", 2.0))
         self.reward_task_weight = float(getattr(stage2_cfg, "reward_task_weight", 3.0))
@@ -94,505 +183,279 @@ class Stage2GRPOTrainer(pl.LightningModule):
         self.similarity_floor = float(getattr(stage2_cfg, "similarity_floor", 0.15))
         self.use_length_guard = bool(getattr(stage2_cfg, "use_length_guard", True))
         self.max_smiles_length = int(getattr(stage2_cfg, "max_smiles_length", 256))
-        self.replay_source_names = set(getattr(stage2_cfg, "replay_source_names", ["PubChemLatent", "ComprehensiveConversation"]))
-        self.rl_source_names = set(getattr(stage2_cfg, "rl_source_names", ["MolEditLatent", "DownstreamTasks"]))
 
-        self.stage1_regression_stds = {
-            "molecular_weight": 500.0,
-            "logp": 5.0,
-            "tpsa": 150.0,
-            "hbd": 5.0,
-            "hba": 10.0,
-            "num_rings": 6.0,
-            "aromatic_ring_count": 4.0,
-            "qed": 1.0,
-        }
+        self.replay_lm_weight = float(getattr(stage2_cfg, "replay_lm_weight", 0.2))
+        self.replay_latent_weight = float(getattr(stage2_cfg, "replay_latent_weight", 1.0))
 
-        self._freeze_for_stage2(stage2_cfg)
+        self.train_lora_only = bool(getattr(stage2_cfg, "train_lora_only", True))
+        self.allow_latent_core_update = bool(getattr(stage2_cfg, "allow_latent_core_update", False))
+        self.allow_stage1_bridge_update = bool(getattr(stage2_cfg, "allow_stage1_bridge_update", False))
 
-    # ---------------------------------------------------------------------
-    # Loading / freezing
-    # ---------------------------------------------------------------------
-    def _set_requires_grad_by_prefix(self, prefixes, flag: bool):
-        prefixes = tuple(prefixes)
-        for name, param in self.named_parameters():
-            if name.startswith(prefixes):
-                param.requires_grad = flag
+        if self.train_lora_only:
+            self._freeze_for_stage2()
 
-    def _freeze_for_stage2(self, stage2_cfg):
-        # Freeze everything first, then selectively re-enable LoRA and optionally a few heads.
-        for _, param in self.named_parameters():
-            param.requires_grad = False
+    def _freeze_for_stage2(self):
+        for name, p in self.named_parameters():
+            p.requires_grad = False
 
-        train_lora_only = bool(getattr(stage2_cfg, "train_lora_only", True))
-        allow_latent_core = bool(getattr(stage2_cfg, "allow_latent_core_update", False))
-        allow_stage1_bridge = bool(getattr(stage2_cfg, "allow_stage1_bridge_update", False))
+        for name, p in self.named_parameters():
+            if "lora_" in name.lower():
+                p.requires_grad = True
 
-        for name, param in self.named_parameters():
-            if "lora_" in name:
-                param.requires_grad = True
+        if self.allow_latent_core_update:
+            for name, p in self.named_parameters():
+                if any(k in name for k in ["mol_llama.latent_proj", "mol_llama.latent_norm"]):
+                    p.requires_grad = True
 
-        if not train_lora_only:
-            self._set_requires_grad_by_prefix([
-                "mol_llama.llm_proj",
-                "mol_llama.latent_proj",
-                "mol_llama.latent_norm",
-                "mol_llama.stage1_hidden_to_latent",
-                "mol_llama.stage1_slot_target_proj",
-            ], True)
+        if self.allow_stage1_bridge_update:
+            for name, p in self.named_parameters():
+                if any(k in name for k in ["mol_llama.stage1_hidden_to_latent", "mol_llama.stage1_slot_target_proj"]):
+                    p.requires_grad = True
 
-        if allow_latent_core:
-            self._set_requires_grad_by_prefix([
-                "mol_llama.latent_proj",
-                "mol_llama.latent_norm",
-            ], True)
+    def _build_prompt_batch(self, batch: Dict[str, Any]) -> _PromptBatch:
+        text_batch = _PromptBatch()
+        text_batch.input_ids = batch["prompt_input_ids"]
+        text_batch.attention_mask = batch["prompt_attention_mask"]
+        text_batch.mol_token_flag = batch["prompt_mol_token_flag"]
+        return text_batch
 
-        if allow_stage1_bridge:
-            self._set_requires_grad_by_prefix([
-                "mol_llama.stage1_hidden_to_latent",
-                "mol_llama.stage1_slot_target_proj",
-            ], True)
+    def _compute_generation_logprobs_from_scores(self, scores, generated_ids):
+        if len(scores) == 0:
+            return torch.zeros(generated_ids.size(0), 0, device=generated_ids.device)
+        step_logprobs = []
+        for t, logits_t in enumerate(scores):
+            logp_t = F.log_softmax(logits_t, dim=-1)
+            ids_t = generated_ids[:, t].unsqueeze(-1)
+            token_logp = logp_t.gather(-1, ids_t).squeeze(-1)
+            step_logprobs.append(token_logp)
+        return torch.stack(step_logprobs, dim=1)
 
-        # Always keep encoder frozen in Stage-II GRPO by default.
-        self._set_requires_grad_by_prefix([
-            "mol_llama.encoder",
-            "mol_llama.llm_proj",
-            "mol_llama.subregion_proj",
-            "mol_llama.stage1_wm_head",
-            "mol_llama.latent_cls_head",
-        ], False)
+    @torch.no_grad()
+    def _rollout_and_sample(self, batch: Dict[str, Any]) -> RolloutCache:
+        prompt_batch = self._build_prompt_batch(batch)
+        prompt_embeds = self.mol_llama._build_prefill_inputs_embeds(batch["graph_batch"], prompt_batch)
+        prompt_mask = batch["prompt_attention_mask"]
 
-        trainable = [n for n, p in self.named_parameters() if p.requires_grad]
-        print(f"[Stage2GRPOTrainer] trainable params: {len(trainable)} tensors")
-        for n in trainable[:20]:
-            print(f"  - {n}")
+        latent_list = []
+        for bi in range(prompt_embeds.size(0)):
+            prefix_embeds = self.mol_llama._extract_valid_prefix_embeds(prompt_embeds[bi], prompt_mask[bi])
+            latent_seq = self.mol_llama._rollout_latent_tokens(prefix_embeds, num_steps=self.mol_llama.stage1_max_latent_slots)
+            latent_list.append(latent_seq)
+        latent_seq = torch.stack(latent_list, dim=0)
 
-    def load_from_stage1_ckpt(self, ckpt_path):
-        self.mol_llama.load_from_ckpt(ckpt_path)
+        exp_prefix, exp_mask, exp_latent = [], [], []
+        for bi in range(prompt_embeds.size(0)):
+            for _ in range(self.num_grpo_generations):
+                exp_prefix.append(prompt_embeds[bi])
+                exp_mask.append(prompt_mask[bi])
+                exp_latent.append(latent_seq[bi])
+        exp_prefix = torch.stack(exp_prefix, dim=0)
+        exp_mask = torch.stack(exp_mask, dim=0)
+        exp_latent = torch.stack(exp_latent, dim=0)
 
-    def load_from_stage2_ckpt(self, ckpt_path):
-        self.mol_llama.load_from_ckpt(ckpt_path)
+        latent_mask = torch.ones(exp_latent.size(0), exp_latent.size(1), device=exp_latent.device, dtype=exp_mask.dtype)
+        full_inputs = torch.cat([exp_prefix, exp_latent], dim=1)
+        full_mask = torch.cat([exp_mask, latent_mask], dim=1)
 
-    def load_from_hf_dir(self, hf_dir):
-        self.mol_llama.load_from_hf_dir(hf_dir)
-
-    # ---------------------------------------------------------------------
-    # Optimization
-    # ---------------------------------------------------------------------
-    def maybe_autocast(self, dtype=torch.float16):
-        enable_autocast = self.device != torch.device("cpu")
-        if enable_autocast:
-            return torch.cuda.amp.autocast(dtype=dtype)
-        return contextlib.nullcontext()
-
-    def configure_optimizers(self):
-        self.trainer.fit_loop.setup_data()
-        warmup_steps = min(len(self.trainer.train_dataloader), self.train_config.warmup_steps)
-        params = [p for p in self.parameters() if p.requires_grad]
-        optimizer = optim.AdamW(params, lr=self.train_config.init_lr, weight_decay=self.train_config.weight_decay)
-        if self.train_config.scheduler == "linear_warmup_cosine_lr":
-            self.scheduler = LinearWarmupCosineLRScheduler(
-                optimizer,
-                self.train_config.max_epochs,
-                self.train_config.min_lr,
-                self.train_config.init_lr,
-                warmup_steps,
-                self.train_config.warmup_lr,
-            )
-        elif self.train_config.scheduler == "None":
-            self.scheduler = None
-        else:
-            raise NotImplementedError(self.train_config.scheduler)
-        return optimizer
-
-    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
-        checkpoint.pop("optimizer_states", None)
-        to_remove = []
-        for key in list(checkpoint.get("state_dict", {}).keys()):
-            try:
-                if not self.get_parameter(key).requires_grad:
-                    to_remove.append(key)
-            except Exception:
-                to_remove.append(key)
-        for key in to_remove:
-            checkpoint["state_dict"].pop(key, None)
-
-    # ---------------------------------------------------------------------
-    # Helpers for prompt / latent replay
-    # ---------------------------------------------------------------------
-    def _as_text_batch(self, input_ids, attention_mask, mol_token_flag, labels=None):
-        tb = SimpleNamespace()
-        tb.input_ids = input_ids
-        tb.attention_mask = attention_mask
-        tb.mol_token_flag = mol_token_flag
-        tb.labels = labels
-        return tb
-
-    def _compute_latent_loss(self, latent_states, slot_targets, slot_mask):
-        if slot_mask.sum() == 0:
-            return torch.tensor(0.0, device=latent_states.device)
-        z = F.normalize(latent_states, dim=-1)
-        t = F.normalize(slot_targets.to(z.dtype), dim=-1)
-        cos = (z * t).sum(dim=-1)
-        valid = slot_mask.to(cos.dtype)
-        return ((1.0 - cos) * valid).sum() / valid.sum().clamp(min=1.0)
-
-    def _build_prompt_embeds(self, batch):
-        text_batch = self._as_text_batch(
-            batch["prompt_input_ids"],
-            batch["prompt_attention_mask"],
-            batch["prompt_mol_token_flag"],
-            None,
-        )
-        return self.mol_llama._build_prefill_inputs_embeds(batch["graph_batch"], text_batch)
-
-    def _extract_valid_prompt_embeds(self, sample_embeds, sample_attention):
-        valid_positions = torch.nonzero(sample_attention > 0, as_tuple=False).flatten()
-        assert valid_positions.numel() > 0, "Empty prompt after padding removal."
-        start = valid_positions[0].item()
-        end = valid_positions[-1].item() + 1
-        return sample_embeds[start:end]
-
-    def _truncate_generated_ids(self, sequences: torch.Tensor) -> torch.Tensor:
-        # For generate(inputs_embeds=...), HF can return either only generated ids or a
-        # sequence including a synthetic prefix. Keeping the tail is the safest option.
-        if sequences.size(1) > self.generation_max_new_tokens:
-            sequences = sequences[:, -self.generation_max_new_tokens :]
-        return sequences
-
-    def _sample_completion_group(self, prompt_embeds: torch.Tensor):
-        latent_seq = self.mol_llama._rollout_latent_tokens(prompt_embeds, num_steps=self.num_latent_steps)
-        cond_embeds = torch.cat([prompt_embeds, latent_seq], dim=0)
-        cond_embeds = cond_embeds.unsqueeze(0).expand(self.num_grpo_generations, -1, -1).contiguous()
-        cond_attn = torch.ones(
-            (self.num_grpo_generations, cond_embeds.shape[1]),
-            device=cond_embeds.device,
-            dtype=torch.long,
-        )
-        outputs = self.mol_llama.llm.generate(
-            inputs_embeds=cond_embeds,
-            attention_mask=cond_attn,
-            do_sample=True,
-            top_p=self.generation_top_p,
-            temperature=self.generation_temperature,
+        gen_out = self.mol_llama.llm.generate(
+            inputs_embeds=full_inputs,
+            attention_mask=full_mask,
             max_new_tokens=self.generation_max_new_tokens,
             min_new_tokens=self.generation_min_new_tokens,
+            do_sample=self.do_sample,
+            temperature=self.generation_temperature,
+            top_p=self.generation_top_p,
+            return_dict_in_generate=True,
+            output_scores=True,
             pad_token_id=self.tokenizer.pad_token_id,
             eos_token_id=self.tokenizer.eos_token_id,
-            num_return_sequences=1,
         )
-        completion_ids = self._truncate_generated_ids(outputs)
-        old_logprobs = self._compute_completion_logprobs(prompt_embeds, latent_seq, completion_ids).detach()
-        texts = self.tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
-        return latent_seq.detach(), completion_ids.detach(), old_logprobs, texts
 
-    def _compute_completion_logprobs(self, prompt_embeds: torch.Tensor, latent_seq: torch.Tensor, completion_ids: torch.Tensor):
-        if completion_ids.ndim == 1:
-            completion_ids = completion_ids.unsqueeze(0)
-        bsz, tgt_len = completion_ids.shape
-        token_embeds = self.mol_llama.llm.get_input_embeddings()(completion_ids)
-        prompt_part = prompt_embeds.unsqueeze(0).expand(bsz, -1, -1)
-        latent_part = latent_seq.unsqueeze(0).expand(bsz, -1, -1)
-        inputs_embeds = torch.cat([prompt_part, latent_part, token_embeds], dim=1)
+        sequences = gen_out.sequences
+        gen_len = len(gen_out.scores)
+        if sequences.size(1) > gen_len:
+            generated_ids = sequences[:, -gen_len:]
+        else:
+            generated_ids = sequences
+        old_logprobs = self._compute_generation_logprobs_from_scores(gen_out.scores, generated_ids)
+        sampled_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
-        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-        completion_mask = (completion_ids != pad_id).long()
-        if completion_mask.sum() == 0:
-            completion_mask = torch.ones_like(completion_ids, dtype=torch.long)
-        prefix_mask = torch.ones(
-            (bsz, prompt_part.shape[1] + latent_part.shape[1]),
-            device=completion_ids.device,
-            dtype=torch.long,
+        return RolloutCache(
+            prefix_embeds=exp_prefix,
+            prefix_mask=exp_mask,
+            latent_seq=exp_latent,
+            generated_ids=generated_ids,
+            sampled_texts=sampled_texts,
+            old_logprobs=old_logprobs,
         )
-        attention_mask = torch.cat([prefix_mask, completion_mask], dim=1)
 
-        labels = completion_ids.clone()
-        labels[completion_mask == 0] = -100
-        ignore_prefix = torch.full(
-            (bsz, prompt_part.shape[1] + latent_part.shape[1]),
-            -100,
-            device=completion_ids.device,
-            dtype=labels.dtype,
-        )
-        labels = torch.cat([ignore_prefix, labels], dim=1)
+    def _build_replay_inputs(self, cache: RolloutCache):
+        answer_ids = cache.generated_ids
+        answer_embeds = self.mol_llama.llm.get_input_embeddings()(answer_ids)
+        inputs_embeds = torch.cat([cache.prefix_embeds, cache.latent_seq, answer_embeds], dim=1)
+        latent_mask = torch.ones(cache.latent_seq.size(0), cache.latent_seq.size(1), device=cache.latent_seq.device, dtype=cache.prefix_mask.dtype)
+        answer_mask = (answer_ids != self.tokenizer.pad_token_id).long()
+        attention_mask = torch.cat([cache.prefix_mask, latent_mask, answer_mask], dim=1)
+        labels = torch.full((inputs_embeds.size(0), inputs_embeds.size(1)), -100, device=inputs_embeds.device, dtype=torch.long)
+        prompt_len = cache.prefix_embeds.size(1) + cache.latent_seq.size(1)
+        labels[:, prompt_len:] = answer_ids
+        return inputs_embeds, attention_mask, labels
 
-        out = self.mol_llama.llm(
+    def _compute_current_token_logprobs(self, cache: RolloutCache):
+        inputs_embeds, attention_mask, labels = self._build_replay_inputs(cache)
+        outputs = self.mol_llama.llm(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             return_dict=True,
-            use_cache=False,
         )
-        logits = out.logits[:, :-1, :]
+        logits = outputs.logits[:, :-1, :]
         shift_labels = labels[:, 1:]
         valid = shift_labels != -100
         safe_labels = shift_labels.masked_fill(~valid, 0)
-        token_logprobs = F.log_softmax(logits, dim=-1).gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
-        seq_logprobs = (token_logprobs * valid.to(token_logprobs.dtype)).sum(dim=1) / valid.sum(dim=1).clamp(min=1)
-        return seq_logprobs
+        logp = F.log_softmax(logits, dim=-1)
+        token_logp = logp.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
+        token_logp = token_logp * valid.float()
+        return token_logp, valid.float()
 
-    # ---------------------------------------------------------------------
-    # Reward helpers
-    # ---------------------------------------------------------------------
-    def _extract_answer_text(self, text: str) -> str:
-        text = (text or "").strip()
-        if len(text) == 0:
-            return text
-        m = re.search(r"<answer>(.*?)</answer>", text, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            return m.group(1).strip()
-        m = re.search(r"Answer\s*:\s*(.*)$", text, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            return m.group(1).strip()
-        return text
-
-    def _extract_smiles(self, text: str) -> Optional[str]:
-        text = (text or "").strip()
-        if len(text) == 0:
-            return None
-        try:
-            obj = json.loads(text)
-            if isinstance(obj, dict):
-                for key in ["molecule", "smiles", "answer", "edited_smiles"]:
-                    value = obj.get(key)
-                    if isinstance(value, str) and len(value.strip()) > 0:
-                        return value.strip()
-        except Exception:
-            pass
-
-        answer = self._extract_answer_text(text)
-        if len(answer) == 0:
-            return None
-        candidates = re.findall(r"[A-Za-z0-9@+\-\[\]\(\)=#$\\/%.]+", answer)
-        candidates = [c for c in candidates if 1 <= len(c) <= self.max_smiles_length]
-        if not candidates:
-            return None
-        # Longest token is usually the actual SMILES rather than a label word.
-        return max(candidates, key=len)
-
-    def _canonicalize_smiles(self, smiles: Optional[str]) -> Optional[str]:
-        if not isinstance(smiles, str) or len(smiles.strip()) == 0:
-            return None
-        mol = Chem.MolFromSmiles(smiles)
-        if mol is None:
-            return None
-        try:
-            return Chem.MolToSmiles(mol, canonical=True)
-        except Exception:
-            return None
-
-    def _valid_smiles(self, smiles: Optional[str]) -> bool:
-        return self._canonicalize_smiles(smiles) is not None
-
-    def _tanimoto(self, smiles_a: Optional[str], smiles_b: Optional[str]) -> float:
-        can_a = self._canonicalize_smiles(smiles_a)
-        can_b = self._canonicalize_smiles(smiles_b)
-        if can_a is None or can_b is None:
+    def _score_format_reward(self, text: str) -> float:
+        txt = str(text).strip()
+        if not txt:
             return 0.0
-        mol_a = Chem.MolFromSmiles(can_a)
-        mol_b = Chem.MolFromSmiles(can_b)
-        if mol_a is None or mol_b is None:
-            return 0.0
-        fp_a = AllChem.GetMorganFingerprintAsBitVect(mol_a, 2, nBits=2048)
-        fp_b = AllChem.GetMorganFingerprintAsBitVect(mol_b, 2, nBits=2048)
-        return float(DataStructs.TanimotoSimilarity(fp_a, fp_b))
-
-    def _parse_binary_answer(self, text: str, dataset_name: str = "") -> Optional[int]:
-        t = (text or "").strip().lower()
-        ds = str(dataset_name or "").upper()
-        if ds == "PAMPA":
-            if "high permeability" in t:
-                return 1
-            if "low permeability" in t or "low-to-moderate" in t or "low to moderate" in t:
-                return 0
-        if re.search(r"\byes\b", t):
-            return 1
-        if re.search(r"\bno\b", t):
-            return 0
-        if re.search(r"\btrue\b", t):
-            return 1
-        if re.search(r"\bfalse\b", t):
-            return 0
-        return None
-
-    def _parse_float_answer(self, text: str) -> Optional[float]:
-        m = re.search(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?", text or "")
-        if not m:
-            return None
-        try:
-            return float(m.group(0))
-        except Exception:
-            return None
-
-    def _score_task_reward(self, batch: Dict[str, Any], sample_idx: int, answer_text: str, pred_smiles: Optional[str]) -> float:
-        task_kind = None
-        task_name = None
-        if "task_kind" in batch and sample_idx < len(batch["task_kind"]):
-            task_kind = batch["task_kind"][sample_idx]
-        if "task_name" in batch and sample_idx < len(batch["task_name"]):
-            task_name = batch["task_name"][sample_idx]
-
-        # 1) Binary downstream tasks.
-        if task_kind == "binary_classification":
-            label_mask = bool(batch["task_label_mask"][sample_idx].item()) if "task_label_mask" in batch else False
-            if label_mask:
-                gold = int(batch["task_label"][sample_idx].item())
-                pred = self._parse_binary_answer(answer_text, dataset_name=str(task_name or ""))
-                if pred is not None:
-                    return 1.0 if int(pred) == gold else 0.0
-
-        # 2) Regression tasks.
-        if task_kind == "regression":
-            reg_mask = bool(batch["task_regression_mask"][sample_idx].item()) if "task_regression_mask" in batch else False
-            if reg_mask:
-                gold = float(batch["task_regression_value"][sample_idx].item())
-                pred = self._parse_float_answer(answer_text)
-                if pred is not None:
-                    scale = max(1.0, abs(gold))
-                    return math.exp(-abs(pred - gold) / scale)
-
-        # 3) Exact/canonical SMILES if gold text itself looks like a molecule.
-        if "text_targets" in batch and sample_idx < len(batch["text_targets"]):
-            gold_text = batch["text_targets"][sample_idx]
-            gold_smiles = self._extract_smiles(str(gold_text))
-            gold_can = self._canonicalize_smiles(gold_smiles)
-            pred_can = self._canonicalize_smiles(pred_smiles)
-            if gold_can is not None and pred_can is not None:
-                return 1.0 if gold_can == pred_can else 0.0
-
-        # 4) Fallback text-match reward as task reward when structured labels are absent.
-        if "text_targets" in batch and sample_idx < len(batch["text_targets"]):
-            gold_text = str(batch["text_targets"][sample_idx] or "").strip().lower()
-            pred_text = self._extract_answer_text(answer_text).strip().lower()
-            if len(gold_text) > 0 and len(pred_text) > 0:
-                return 1.0 if gold_text == pred_text else 0.0
-        return 0.0
-
-    def _score_text_match_reward(self, batch: Dict[str, Any], sample_idx: int, answer_text: str) -> float:
-        if "text_targets" not in batch or sample_idx >= len(batch["text_targets"]):
-            return 0.0
-        gold_text = str(batch["text_targets"][sample_idx] or "").strip().lower()
-        pred_text = self._extract_answer_text(answer_text).strip().lower()
-        if len(gold_text) == 0 or len(pred_text) == 0:
-            return 0.0
-        if gold_text == pred_text:
+        if "<answer>" in txt and "</answer>" in txt:
             return 1.0
-        if gold_text in pred_text or pred_text in gold_text:
-            return 0.5
-        return 0.0
+        if "Answer:" in txt:
+            return 1.0
+        return 0.2
 
-    def _score_faithfulness_reward(self, source_smiles: str, pred_smiles: Optional[str]) -> float:
-        sim = self._tanimoto(source_smiles, pred_smiles)
-        if sim < self.similarity_floor:
+    def _score_text_match_reward(self, pred_smiles: Optional[str], target_smiles: Optional[str]) -> float:
+        if not pred_smiles or not target_smiles:
             return 0.0
-        return sim
+        try:
+            pm = Chem.MolFromSmiles(pred_smiles)
+            tm = Chem.MolFromSmiles(target_smiles)
+            if pm is None or tm is None:
+                return 0.0
+            return 1.0 if Chem.MolToSmiles(pm, canonical=True) == Chem.MolToSmiles(tm, canonical=True) else 0.0
+        except Exception:
+            return 0.0
 
-    def _compute_reward_breakdown(self, batch: Dict[str, Any], sample_idx: int, generated_text: str) -> RewardBreakdown:
-        answer_text = self._extract_answer_text(generated_text)
-        pred_smiles = self._extract_smiles(answer_text)
-        source_smiles = batch["smiles"][sample_idx] if sample_idx < len(batch["smiles"]) else ""
+    def _score_task_reward(self, pred_smiles: Optional[str], task_spec: Dict[str, Any], subtask: Optional[str]) -> float:
+        if not pred_smiles:
+            return 0.0
+        mol = Chem.MolFromSmiles(pred_smiles)
+        if mol is None:
+            return 0.0
 
-        format_reward = 1.0 if len(answer_text.strip()) > 0 else 0.0
-        validity_reward = 1.0 if self._valid_smiles(pred_smiles) else 0.0
-        task_reward = self._score_task_reward(batch, sample_idx, answer_text, pred_smiles)
-        faithfulness_reward = self._score_faithfulness_reward(source_smiles, pred_smiles)
-        text_match_reward = self._score_text_match_reward(batch, sample_idx, answer_text)
+        subtask_low = str(subtask or task_spec.get("subtask") or "").strip().lower()
+        if subtask_low == "atomnum":
+            target = task_spec.get("element_counts", {}) or {}
+            pred = _atomic_counts(mol)
+            return _scaled_exactish_reward(pred, target)
+        if subtask_low == "bondnum":
+            target = task_spec.get("bond_constraints", {}) or {}
+            pred = _bond_profile(mol)
+            return _scaled_exactish_reward(pred, target)
+        if subtask_low == "functionalgroup":
+            required = list(task_spec.get("functional_groups", []) or [])
+            return _functional_group_score(mol, required)
 
-        total = (
-            self.reward_format_weight * format_reward
-            + self.reward_validity_weight * validity_reward
-            + self.reward_task_weight * task_reward
-            + self.reward_faithfulness_weight * faithfulness_reward
-            + self.reward_text_match_weight * text_match_reward
-        )
-        return RewardBreakdown(
-            total=float(total),
-            format_reward=float(format_reward),
-            validity_reward=float(validity_reward),
-            task_reward=float(task_reward),
-            faithfulness_reward=float(faithfulness_reward),
-            text_match_reward=float(text_match_reward),
-        )
+        # fallback mixed task scoring
+        score = 0.0
+        if task_spec.get("element_counts"):
+            score += _scaled_exactish_reward(_atomic_counts(mol), task_spec.get("element_counts", {}))
+        if task_spec.get("bond_constraints"):
+            score += _scaled_exactish_reward(_bond_profile(mol), task_spec.get("bond_constraints", {}))
+        if task_spec.get("functional_groups"):
+            score += _functional_group_score(mol, list(task_spec.get("functional_groups", [])))
+        return min(1.0, score / max(1, sum(bool(task_spec.get(k)) for k in ["element_counts", "bond_constraints", "functional_groups"])))
 
-    # ---------------------------------------------------------------------
-    # Training step modes
-    # ---------------------------------------------------------------------
-    def _training_step_replay(self, batch):
-        outputs = self.mol_llama.forward_stage1(batch)
-        lm_loss = outputs["lm_loss"] if outputs["lm_loss"] is not None else torch.tensor(0.0, device=self.device)
-        latent_loss = self._compute_latent_loss(
-            outputs["latent_states"],
-            outputs["slot_targets"],
-            batch["latent_slot_mask"].to(outputs["latent_states"].device),
-        )
-        loss = self.replay_lm_weight * lm_loss + self.replay_latent_weight * latent_loss
-        return loss, {
-            "replay/loss": loss.detach(),
-            "replay/loss_lm": lm_loss.detach(),
-            "replay/loss_latent": latent_loss.detach(),
+    def _compute_rewards(self, cache: RolloutCache, batch: Dict[str, Any]):
+        bsz = batch["input_ids"].size(0)
+        rewards = []
+        for i, text in enumerate(cache.sampled_texts):
+            src_idx = i // self.num_grpo_generations
+            pred_smiles = _find_valid_smiles(text)
+            format_r = self._score_format_reward(text)
+            valid_r = 1.0 if pred_smiles is not None else 0.0
+            subtask = batch.get("subtask_list", [None] * bsz)[src_idx]
+            task_spec = batch.get("task_spec_list", [{}] * bsz)[src_idx] or {}
+            task_r = self._score_task_reward(pred_smiles, task_spec, subtask)
+
+            target_smiles = batch.get("target_smiles_list", [None] * bsz)[src_idx]
+            text_match_r = self._score_text_match_reward(pred_smiles, target_smiles)
+
+            source_smiles = batch.get("source_smiles_list", [None] * bsz)[src_idx]
+            faith_r = _tanimoto(pred_smiles, source_smiles) if source_smiles else 0.0
+            if faith_r < self.similarity_floor:
+                faith_r = 0.0
+
+            if self.use_length_guard and pred_smiles is not None and len(pred_smiles) > self.max_smiles_length:
+                valid_r = 0.0
+                task_r *= 0.5
+
+            reward = (
+                self.reward_format_weight * format_r
+                + self.reward_validity_weight * valid_r
+                + self.reward_task_weight * task_r
+                + self.reward_faithfulness_weight * faith_r
+                + self.reward_text_match_weight * text_match_r
+            )
+            rewards.append(reward)
+
+        rew = torch.tensor(rewards, device=self.device, dtype=torch.float32).view(bsz, self.num_grpo_generations)
+        mean = rew.mean(dim=1, keepdim=True)
+        std = rew.std(dim=1, keepdim=True).clamp(min=1e-6)
+        adv = (rew - mean) / std
+        return rew, adv
+
+    def _grpo_step(self, batch: Dict[str, Any]):
+        cache = self._rollout_and_sample(batch)
+        rewards, advantages = self._compute_rewards(cache, batch)
+        current_logprobs, valid_mask = self._compute_current_token_logprobs(cache)
+        old_logprobs = cache.old_logprobs
+
+        min_len = min(current_logprobs.size(1), old_logprobs.size(1))
+        current_logprobs = current_logprobs[:, :min_len]
+        old_logprobs = old_logprobs[:, :min_len]
+        valid_mask = valid_mask[:, :min_len]
+
+        flat_adv = advantages.reshape(-1).unsqueeze(1).expand_as(current_logprobs)
+        ratio = torch.exp(current_logprobs - old_logprobs)
+        clipped_ratio = torch.clamp(ratio, 1.0 - self.grpo_clip_eps, 1.0 + self.grpo_clip_eps)
+        obj1 = ratio * flat_adv
+        obj2 = clipped_ratio * flat_adv
+        policy_obj = torch.minimum(obj1, obj2) * valid_mask
+        policy_loss = -policy_obj.sum() / valid_mask.sum().clamp(min=1.0)
+        approx_kl = ((old_logprobs - current_logprobs) * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
+        total_loss = policy_loss + self.grpo_kl_beta * approx_kl
+        return total_loss, {
+            "train/rl_loss": total_loss.detach(),
+            "train/policy_loss": policy_loss.detach(),
+            "train/approx_kl": approx_kl.detach(),
+            "train/reward_mean": rewards.mean().detach(),
+            "train/reward_max": rewards.max().detach(),
         }
-
-    def _training_step_grpo(self, batch):
-        prompt_embeds_batch = self._build_prompt_embeds(batch)
-        sample_losses = []
-        total_rewards = []
-        format_rewards = []
-        validity_rewards = []
-        task_rewards = []
-        faithfulness_rewards = []
-        text_match_rewards = []
-
-        for bi in range(prompt_embeds_batch.size(0)):
-            prompt_embeds = self._extract_valid_prompt_embeds(prompt_embeds_batch[bi], batch["prompt_attention_mask"][bi])
-            latent_seq, completion_ids, old_logprobs, texts = self._sample_completion_group(prompt_embeds)
-
-            reward_list = [self._compute_reward_breakdown(batch, bi, txt) for txt in texts]
-            rewards = torch.tensor([rb.total for rb in reward_list], device=prompt_embeds.device, dtype=torch.float32)
-            advantages = (rewards - rewards.mean()) / rewards.std(unbiased=False).clamp(min=1e-6)
-            current_logprobs = self._compute_completion_logprobs(prompt_embeds, latent_seq, completion_ids)
-            ratio = torch.exp(current_logprobs - old_logprobs)
-            unclipped = ratio * advantages
-            clipped = torch.clamp(ratio, 1.0 - self.grpo_clip_eps, 1.0 + self.grpo_clip_eps) * advantages
-            sample_loss = -torch.min(unclipped, clipped).mean()
-            sample_losses.append(sample_loss)
-
-            total_rewards.extend([rb.total for rb in reward_list])
-            format_rewards.extend([rb.format_reward for rb in reward_list])
-            validity_rewards.extend([rb.validity_reward for rb in reward_list])
-            task_rewards.extend([rb.task_reward for rb in reward_list])
-            faithfulness_rewards.extend([rb.faithfulness_reward for rb in reward_list])
-            text_match_rewards.extend([rb.text_match_reward for rb in reward_list])
-
-        loss = torch.stack(sample_losses).mean() if sample_losses else torch.tensor(0.0, device=self.device)
-        metrics = {
-            "grpo/loss": loss.detach(),
-            "grpo/reward_total": torch.tensor(total_rewards, device=self.device).mean() if total_rewards else torch.tensor(0.0, device=self.device),
-            "grpo/reward_format": torch.tensor(format_rewards, device=self.device).mean() if format_rewards else torch.tensor(0.0, device=self.device),
-            "grpo/reward_validity": torch.tensor(validity_rewards, device=self.device).mean() if validity_rewards else torch.tensor(0.0, device=self.device),
-            "grpo/reward_task": torch.tensor(task_rewards, device=self.device).mean() if task_rewards else torch.tensor(0.0, device=self.device),
-            "grpo/reward_faithfulness": torch.tensor(faithfulness_rewards, device=self.device).mean() if faithfulness_rewards else torch.tensor(0.0, device=self.device),
-            "grpo/reward_text_match": torch.tensor(text_match_rewards, device=self.device).mean() if text_match_rewards else torch.tensor(0.0, device=self.device),
-        }
-        return loss, metrics
 
     def training_step(self, batch, batch_idx):
+        train_mode = batch.get("train_mode", "rl")
+        if train_mode == "replay":
+            return super().training_step(batch, batch_idx)
+
         if self.scheduler:
             self.scheduler.step(self.trainer.current_epoch, self.trainer.global_step)
 
+        loss, metrics = self._grpo_step(batch)
         batch_size = batch["input_ids"].size(0)
-        source_name = batch["source_dataset"][0] if len(batch["source_dataset"]) > 0 else "unknown"
-        mode = batch.get("train_mode", "rl")
-        if mode == "replay":
-            loss, metrics = self._training_step_replay(batch)
-        else:
-            loss, metrics = self._training_step_grpo(batch)
-
         self.log("train/loss_total", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
-        self.log("train/lr", self.trainer.optimizers[0].param_groups[0]["lr"], on_step=True, on_epoch=False, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
-        self.log("train/mode_is_replay", 1.0 if mode == "replay" else 0.0, on_step=True, on_epoch=False, logger=True, batch_size=batch_size, sync_dist=True)
-        self.log("train/source_name", float(hash(source_name) % 1000), on_step=True, on_epoch=False, logger=False, batch_size=batch_size, sync_dist=False)
-        for key, value in metrics.items():
-            self.log(key, value, on_step=True, on_epoch=True, prog_bar=False, logger=True, batch_size=batch_size, sync_dist=True)
-
-        if self.global_step % 50 == 0:
-            print(f"[Stage2-GRPO] step={self.global_step} source={source_name} mode={mode} loss={float(loss):.4f}")
+        for k, v in metrics.items():
+            self.log(k, v, on_step=True, on_epoch=True, prog_bar=("reward" in k or "loss" in k), logger=True, batch_size=batch_size, sync_dist=True)
+        if self.global_step % 100 == 0:
+            sources = batch.get("source_dataset", [])
+            subtasks = batch.get("subtask_list", [])
+            print(f"[Stage2-GRPO] step={self.global_step} source={sources[0] if sources else 'unknown'} subtask={subtasks[0] if subtasks else 'unknown'} loss={float(loss):.4f}")
         return loss
+
+    @torch.no_grad()
+    def validation_step(self, batch, batch_idx):
+        # Reuse Stage-I validation on the provided moledit validation set.
+        return super().validation_step(batch, batch_idx)

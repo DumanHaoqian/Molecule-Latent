@@ -1,17 +1,53 @@
-# Keep this aligned with your Stage I unified data settings.
-# You should replace these with your actual local paths.
+data:
+  num_workers: 4
+  batch_size: 2
+  text_max_len: 512
+  latent_slot_text_max_len: 48
 
-batch_size: 2
-num_workers: 4
-text_max_len: 512
-root: .
+  # Replay / SFT sources from Stage I.
+  latent_path: "/home/haoqian/Data/Molecule/Datasets/Train/02PubChem/latent_world_modeling.jsonl"
+  conversation_path: "/home/haoqian/Data/Molecule/Datasets/Train/01Conversation/conversation_sft_with_worldmodel.jsonl"
 
-# Example source controls if your existing config system reads them:
-pubchem_path: /path/to/pubchem_latent_world_modeling.jsonl
-conversation_path: /path/to/conversation_sft.jsonl
-moledit_path: /path/to/moledit_train.jsonl
+  # Stage-II unified jsonl converted from TOMG-Bench / OpenMolIns CSV.
+  stage2_path: "/home/haoqian/Data/Molecule/Construction/Datasets/05TomgBench/train_small_worldmodel.jsonl"
 
-source_sampling_weights:
-  pubchem: 0.1
-  conversation: 0.1
-  moledit: 0.8
+  # Validation set: use the Stage-I MolEdit validation jsonl here.
+  moledit_val_path: "/home/haoqian/Data/Molecule/Datasets/Train/03MolEdit/mol_edit_with_worldmodel_val.jsonl"
+
+  enabled_sources:
+    - pubchem
+    - conversation
+    - stage2
+
+  replay_sources:
+    - pubchem
+    - conversation
+  rl_sources:
+    - stage2
+
+  # Directly control SFT / RL batch ratio.
+  # Example: 0.1 SFT + 0.9 RL
+  replay_ratio: 0.1
+  rl_ratio: 0.9
+
+  # How to mix sources inside each group.
+  replay_source_weights:
+    pubchem: 0.5
+    conversation: 0.5
+  rl_source_weights:
+    stage2: 1.0
+
+  # Overall fraction knobs.
+  total_data_fraction: 1.0
+  total_data_fraction_by_source: {}
+  stage2_data_fraction: 0.8
+
+  # Select only specific Stage-II subtasks.
+  # Leave empty to use all.
+  stage2_subtasks:
+    - AtomNum
+  val_subtasks: []
+
+  split_seed: 42
+  steps_per_epoch: 0
+  fallback_raw_paths: {}
