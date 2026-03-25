@@ -5,7 +5,7 @@ cd /home/haoqian/Data/Molecule/Latent
 mkdir -p logs
 
 # Two-GPU DDP on physical GPUs 1 and 5.
-export CUDA_VISIBLE_DEVICES="1,5"
+export CUDA_VISIBLE_DEVICES="4,7"
 export TOKENIZERS_PARALLELISM=false
 
 PYTHON_BIN_DEFAULT="/home/haoqian/Data/miniconda3/envs/molllama/bin/python"

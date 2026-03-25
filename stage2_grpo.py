@@ -215,12 +215,17 @@ def main():
 
     has_eval_data = len(eval_moledit_test_paths) > 0
     has_eval_data = has_eval_data or bool(str(_cfg_get(data_cfg, "moledit_val_path", "")).strip())
-    if has_eval_data:
+    # Avoid run interruption when validation metrics are absent at checkpoint time.
+    # Default to a stable training metric; can be overridden in config.
+    monitor_name = str(_cfg_get(train_config, "checkpoint_monitor", "train/loss_total_epoch"))
+    monitor_mode = str(_cfg_get(train_config, "checkpoint_monitor_mode", "min"))
+    if has_eval_data and monitor_name == "auto":
         monitor_name = "val/score"
         monitor_mode = "max"
-    else:
+    if not monitor_name:
         monitor_name = "train/loss_total_epoch"
         monitor_mode = "min"
+    print(f"[Stage2-GRPO] checkpoint monitor: {monitor_name} ({monitor_mode})")
     best_ckpt_cb = ModelCheckpoint(
         dirpath=ckpt_dir,
         filename=f"{run_name_tag}-step{{step:08d}}",

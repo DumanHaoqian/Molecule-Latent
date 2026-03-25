@@ -54,6 +54,7 @@ class RolloutCache:
     generated_ids: torch.Tensor
     sampled_texts: List[str]
     old_logprobs: torch.Tensor
+    score_len: int
 
 
 class _PromptBatch:
@@ -197,6 +198,7 @@ class Stage2GRPOTrainer(Stage1Trainer):
         self.train_lora_only = bool(getattr(stage2_cfg, "train_lora_only", True))
         self.allow_latent_core_update = bool(getattr(stage2_cfg, "allow_latent_core_update", False))
         self.allow_stage1_bridge_update = bool(getattr(stage2_cfg, "allow_stage1_bridge_update", False))
+        self.grpo_debug_every_n_steps = int(getattr(stage2_cfg, "grpo_debug_every_n_steps", 20))
 
         if self.train_lora_only:
             self._freeze_for_stage2()
@@ -290,11 +292,22 @@ class Stage2GRPOTrainer(Stage1Trainer):
 
         sequences = gen_out.sequences
         gen_len = len(gen_out.scores)
-        if sequences.size(1) > gen_len:
+        prompt_plus_latent_len = full_inputs.size(1)
+        if sequences.size(1) > prompt_plus_latent_len:
+            # When HF returns full sequence (prompt + generated), strip the prefix.
+            generated_ids = sequences[:, prompt_plus_latent_len:]
+        elif gen_len > 0 and sequences.size(1) > gen_len:
+            # Fallback for implementations that only expose score length reliably.
             generated_ids = sequences[:, -gen_len:]
         else:
             generated_ids = sequences
-        old_logprobs = self._compute_generation_logprobs_from_scores(gen_out.scores, generated_ids)
+        # Some generation backends can return empty `scores` while still producing
+        # non-empty `sequences`. In that case, keep an empty old_logprobs here and
+        # recover in _grpo_step via current_logprobs.detach().
+        if gen_len > 0 and generated_ids.size(1) == gen_len:
+            old_logprobs = self._compute_generation_logprobs_from_scores(gen_out.scores, generated_ids)
+        else:
+            old_logprobs = torch.zeros(generated_ids.size(0), 0, device=generated_ids.device)
         sampled_texts = self.tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
 
         return RolloutCache(
@@ -304,6 +317,7 @@ class Stage2GRPOTrainer(Stage1Trainer):
             generated_ids=generated_ids,
             sampled_texts=sampled_texts,
             old_logprobs=old_logprobs,
+            score_len=gen_len,
         )
 
     def _build_replay_inputs(self, cache: RolloutCache):
@@ -430,6 +444,19 @@ class Stage2GRPOTrainer(Stage1Trainer):
         rewards, advantages = self._compute_rewards(cache, batch)
         current_logprobs, valid_mask = self._compute_current_token_logprobs(cache)
         old_logprobs = cache.old_logprobs
+        old_missing_scores = 1.0 if old_logprobs.size(1) == 0 else 0.0
+        # Fallback: if rollout scores are unavailable, use detached current policy as
+        # the old policy baseline for a single-step GRPO update.
+        if old_logprobs.size(1) == 0 and current_logprobs.size(1) > 0:
+            old_logprobs = current_logprobs.detach()
+
+        generated_len = float(cache.generated_ids.size(1))
+        score_len = float(cache.score_len)
+        old_logprobs_len = float(old_logprobs.size(1))
+        valid_token_ratio_full = float(valid_mask.mean().item()) if valid_mask.numel() > 0 else 0.0
+        reward_std = float(rewards.std().item()) if rewards.numel() > 1 else 0.0
+        adv_abs_mean = float(advantages.abs().mean().item()) if advantages.numel() > 0 else 0.0
+        adv_std = float(advantages.std().item()) if advantages.numel() > 1 else 0.0
 
         min_len = min(current_logprobs.size(1), old_logprobs.size(1))
         if min_len <= 0:
@@ -441,10 +468,23 @@ class Stage2GRPOTrainer(Stage1Trainer):
                 "train/reward_mean": rewards.mean().detach(),
                 "train/reward_max": rewards.max().detach(),
                 "train/grpo_invalid_batch": torch.tensor(1.0, device=self.device),
+                "train/grpo_invalid_no_token": torch.tensor(1.0, device=self.device),
+                "train/grpo_invalid_nonfinite": torch.tensor(0.0, device=self.device),
+                "train/grpo_invalid_nograd": torch.tensor(0.0, device=self.device),
+                "train/grpo_generated_len": torch.tensor(generated_len, device=self.device),
+                "train/grpo_score_len": torch.tensor(score_len, device=self.device),
+                "train/grpo_old_logprobs_len": torch.tensor(old_logprobs_len, device=self.device),
+                "train/grpo_min_len": torch.tensor(0.0, device=self.device),
+                "train/grpo_valid_token_ratio": torch.tensor(valid_token_ratio_full, device=self.device),
+                "train/grpo_old_missing_scores": torch.tensor(old_missing_scores, device=self.device),
+                "train/grpo_reward_std": torch.tensor(reward_std, device=self.device),
+                "train/grpo_adv_abs_mean": torch.tensor(adv_abs_mean, device=self.device),
+                "train/grpo_adv_std": torch.tensor(adv_std, device=self.device),
             }
         current_logprobs = current_logprobs[:, :min_len]
         old_logprobs = old_logprobs[:, :min_len]
         valid_mask = valid_mask[:, :min_len]
+        valid_token_ratio = float(valid_mask.mean().item()) if valid_mask.numel() > 0 else 0.0
 
         current_logprobs = torch.nan_to_num(current_logprobs, nan=0.0, posinf=0.0, neginf=0.0)
         old_logprobs = torch.nan_to_num(old_logprobs, nan=0.0, posinf=0.0, neginf=0.0)
@@ -460,7 +500,9 @@ class Stage2GRPOTrainer(Stage1Trainer):
         approx_kl = ((old_logprobs - current_logprobs) * valid_mask).sum() / valid_mask.sum().clamp(min=1.0)
         total_loss = policy_loss + self.grpo_kl_beta * approx_kl
 
-        invalid = (not torch.isfinite(total_loss).item()) or (not total_loss.requires_grad)
+        invalid_nonfinite = not torch.isfinite(total_loss).item()
+        invalid_nograd = not total_loss.requires_grad
+        invalid = invalid_nonfinite or invalid_nograd
         if invalid:
             total_loss = self._zero_like_trainable_loss()
             policy_loss = torch.tensor(0.0, device=self.device)
@@ -472,6 +514,18 @@ class Stage2GRPOTrainer(Stage1Trainer):
             "train/reward_mean": rewards.mean().detach(),
             "train/reward_max": rewards.max().detach(),
             "train/grpo_invalid_batch": torch.tensor(1.0 if invalid else 0.0, device=self.device),
+            "train/grpo_invalid_no_token": torch.tensor(0.0, device=self.device),
+            "train/grpo_invalid_nonfinite": torch.tensor(1.0 if invalid_nonfinite else 0.0, device=self.device),
+            "train/grpo_invalid_nograd": torch.tensor(1.0 if invalid_nograd else 0.0, device=self.device),
+            "train/grpo_generated_len": torch.tensor(generated_len, device=self.device),
+            "train/grpo_score_len": torch.tensor(score_len, device=self.device),
+            "train/grpo_old_logprobs_len": torch.tensor(old_logprobs_len, device=self.device),
+            "train/grpo_min_len": torch.tensor(float(min_len), device=self.device),
+            "train/grpo_valid_token_ratio": torch.tensor(valid_token_ratio, device=self.device),
+            "train/grpo_old_missing_scores": torch.tensor(old_missing_scores, device=self.device),
+            "train/grpo_reward_std": torch.tensor(reward_std, device=self.device),
+            "train/grpo_adv_abs_mean": torch.tensor(adv_abs_mean, device=self.device),
+            "train/grpo_adv_std": torch.tensor(adv_std, device=self.device),
         }
 
     def training_step(self, batch, batch_idx):
@@ -486,11 +540,36 @@ class Stage2GRPOTrainer(Stage1Trainer):
         batch_size = batch["input_ids"].size(0)
         self.log("train/loss_total", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=batch_size, sync_dist=True)
         for k, v in metrics.items():
-            self.log(k, v, on_step=True, on_epoch=True, prog_bar=("reward" in k or "loss" in k), logger=True, batch_size=batch_size, sync_dist=True)
-        if self.global_step % 100 == 0:
+            show_in_bar = ("reward" in k or "loss" in k or "grpo_invalid" in k)
+            self.log(k, v, on_step=True, on_epoch=True, prog_bar=show_in_bar, logger=True, batch_size=batch_size, sync_dist=True)
+
+        invalid_now = float(metrics.get("train/grpo_invalid_batch", torch.tensor(0.0, device=self.device)).detach().item()) > 0.5
+        if invalid_now or (self.global_step % max(1, self.grpo_debug_every_n_steps) == 0):
             sources = batch.get("source_dataset", [])
             subtasks = batch.get("subtask_list", [])
-            print(f"[Stage2-GRPO] step={self.global_step} source={sources[0] if sources else 'unknown'} subtask={subtasks[0] if subtasks else 'unknown'} loss={float(loss):.4f}")
+            def _fv(key):
+                v = metrics.get(key, None)
+                if v is None:
+                    return float("nan")
+                try:
+                    return float(v.detach().item())
+                except Exception:
+                    return float("nan")
+
+            print(
+                f"[Stage2-GRPO][debug] step={self.global_step} "
+                f"source={sources[0] if sources else 'unknown'} "
+                f"subtask={subtasks[0] if subtasks else 'unknown'} "
+                f"loss={float(loss):.4f} rl={_fv('train/rl_loss'):.4f} policy={_fv('train/policy_loss'):.4f} "
+                f"invalid={_fv('train/grpo_invalid_batch'):.0f} no_token={_fv('train/grpo_invalid_no_token'):.0f} "
+                f"nonfinite={_fv('train/grpo_invalid_nonfinite'):.0f} nograd={_fv('train/grpo_invalid_nograd'):.0f} "
+                f"gen_len={_fv('train/grpo_generated_len'):.0f} score_len={_fv('train/grpo_score_len'):.0f} "
+                f"oldlp_len={_fv('train/grpo_old_logprobs_len'):.0f} min_len={_fv('train/grpo_min_len'):.0f} "
+                f"valid_tok_ratio={_fv('train/grpo_valid_token_ratio'):.4f} "
+                f"old_missing={_fv('train/grpo_old_missing_scores'):.0f} "
+                f"rew_mean={_fv('train/reward_mean'):.4f} rew_std={_fv('train/grpo_reward_std'):.4f} "
+                f"adv_abs={_fv('train/grpo_adv_abs_mean'):.4f} adv_std={_fv('train/grpo_adv_std'):.4f}"
+            )
         return loss
 
     @torch.no_grad()
