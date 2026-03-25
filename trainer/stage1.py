@@ -748,8 +748,6 @@ class Stage1Trainer(pl.LightningModule):
     def on_validation_epoch_end(self):
         if self.trainer.sanity_checking:
             return
-        if not self.trainer.is_global_zero:
-            return
         row = {
             "global_step": int(self.global_step),
             "epoch": int(self.current_epoch),
@@ -788,14 +786,17 @@ class Stage1Trainer(pl.LightningModule):
             me_correct_rate = 0.0
 
         # Define unified score as overall moledit correct_rate for checkpoint ranking.
-        self.log("val/score", me_correct_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
-        self.log("val/moledit_valid_rate", me_valid_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
-        self.log("val/moledit_exact_match_rate", me_exact_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
-        self.log("val/moledit_correct_rate", me_correct_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=False)
+        self.log("val/score", me_correct_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("val/moledit_valid_rate", me_valid_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("val/moledit_exact_match_rate", me_exact_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
+        self.log("val/moledit_correct_rate", me_correct_rate, on_step=False, on_epoch=True, prog_bar=True, logger=True, sync_dist=True)
         row["val_score"] = me_correct_rate
         row["val_moledit_valid_rate"] = me_valid_rate
         row["val_moledit_exact_match_rate"] = me_exact_rate
         row["val_moledit_correct_rate"] = me_correct_rate
+
+        if not self.trainer.is_global_zero:
+            return
 
         csv_path = self.test_results_csv_path
         os.makedirs(os.path.dirname(csv_path), exist_ok=True)

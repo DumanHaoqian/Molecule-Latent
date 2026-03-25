@@ -99,6 +99,11 @@ def main():
     parser.add_argument("--train_config", default=os.path.join("configs", "stage1", "train_config.yaml"))
     parser.add_argument("--data_config", default=os.path.join("configs", "stage1", "data_config.yaml"))
     parser.add_argument("--run_name", default="", help="Optional run name override for W&B and checkpoint naming.")
+    parser.add_argument(
+        "--init_stage1_ckpt",
+        default="",
+        help="Optional Stage-I checkpoint to warm-start after loading stage0 backbone.",
+    )
     args = parser.parse_args()
 
     train_config, data_config = _load_configs(args.train_config, args.data_config)
@@ -114,6 +119,7 @@ def main():
     loss_weights = _cfg_get(train_config, "loss_weights", {})
 
     stage0_checkpoint_path = str(_cfg_get(model_cfg, "stage0_checkpoint_path", ""))
+    init_stage1_ckpt = str(args.init_stage1_ckpt or "").strip()
     llm_model_name = str(_cfg_get(model_cfg, "llm_model", "meta-llama/Llama-3.1-8B-Instruct"))
 
     model_config = MolLLaMAConfig()
@@ -131,6 +137,11 @@ def main():
             model.load_from_hf_dir(stage0_checkpoint_path)
         else:
             model.load_from_ckpt(stage0_checkpoint_path)
+    if init_stage1_ckpt:
+        print(f"[Stage1] stage1 init checkpoint path: {init_stage1_ckpt}")
+        if not os.path.exists(init_stage1_ckpt):
+            raise FileNotFoundError(f"[Stage1] stage1 init checkpoint path not found: {init_stage1_ckpt}")
+        model.load_from_ckpt(init_stage1_ckpt)
     unimol_dictionary = getattr(model.mol_llama.encoder, "unimol_dictionary", None)
 
     downstream_paths = _cfg_get(data_cfg, "downstream_paths", [])

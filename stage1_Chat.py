@@ -13,7 +13,7 @@ from utils.configuration_mol_llama import MolLLaMAConfig
 
 DEFAULT_TRAIN_CONFIG = "/home/haoqian/Data/Molecule/Latent/configs/stage1/train_config.yaml"
 DEFAULT_STAGE1_CKPT_DIR = "/home/haoqian/Data/Molecule/Latent/checkpoints/stage1"
-DEFAULT_STAGE1_CKPT_PATH = "/home/haoqian/Data/Molecule/Latent/checkpoints/stage1/last-v3.ckpt"
+DEFAULT_STAGE1_CKPT_PATH = "/home/haoqian/Data/Molecule/Latent/checkpoints/stage1/20260322_002518-naive-lr-4slots-dorfrz77/naive-lr-4slots-stepstep=00044036.ckpt"
 
 
 def _pick_checkpoint(ckpt_path: str, ckpt_dir: str) -> str:
